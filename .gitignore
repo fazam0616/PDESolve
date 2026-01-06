@@ -1,0 +1,15 @@
+/.vscode
+/build
+/calculus.o
+/expression.o
+/frame.png
+/massif.out
+/valgrind_interactive.txt
+/valgrind_output.txt
+/wave.mp4
+/wave_lossless.mp4
+/wave_output
+/wave_rgb.mp4
+/wave_scaled.mp4
+/wave_sponge.mp4
+/wave_zero_deriv.mp4
