@@ -446,7 +446,7 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
     // Row 3: Amplitude slider
     MenuRow *m_row3 = menurow_create();
     menurow_add_interaction(m_row3,
-        variableinteraction_create(&sim->wave_amplitude, "Amplitude", 0.01, 0.5, VAR_SLIDER,
+        variableinteraction_create(&sim->wave_amplitude, "Amplitude", -0.1, 0.1, VAR_SLIDER,
                                   NULL, NULL));
     menu_add_row(menus->mouse_menu, m_row3);
     
@@ -494,7 +494,7 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
     
     MenuRow *s_row3 = menurow_create();
     menurow_add_interaction(s_row3,
-        variableinteraction_create(&sim->wave_speed, "Wave Speed", 0.1, 2.0, VAR_SLIDER,
+        variableinteraction_create(&sim->wave_speed, "Wave Speed", 0.1, 20.0, VAR_SLIDER,
                                   NULL, NULL));
     menu_add_row(menus->sim_menu, s_row3);
     

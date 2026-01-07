@@ -44,7 +44,7 @@ typedef enum {
 // Mouse interaction modes
 typedef enum {
     MOUSE_NONE,         // No interaction
-    MOUSE_ADD_WAVE,     // Click to add wave pulse
+    MOUSE_ADD_WAVE,     // Click or drag to add wave pulses
     MOUSE_ADD_BARRIER,  // Click to add reflecting barriers (line segments)
     MOUSE_SOURCE        // Click to add/select/move oscillating wave sources
 } MouseMode;
@@ -177,6 +177,12 @@ static double g_default_source_frequency = 5.0;
 
 // Default source phase for adding new sources
 static double g_default_source_phase = 0.0;
+
+// Wave painting state (for drag support)
+static int wave_painting = 0;           // Is user currently painting waves?
+static double last_wave_x = -1.0;       // Last position where wave was added
+static double last_wave_y = -1.0;
+static double wave_paint_spacing = 0.1; // Minimum distance between waves (physical units)
 
 // Centralized menu slider drag state
 typedef struct {
@@ -605,74 +611,6 @@ double estimate_wave_energy(SimulationState *sim, double amplitude, double sigma
 void simulation_step(SimulationState *sim) {
     if (sim->paused) return;
     
-    // Update variable dictionary with current field values
-    dict_set(sim->vars, "u_curr", &sim->u_curr->data);
-    dict_set(sim->vars, "u_prev", &sim->u_prev->data);
-    
-    // Evaluate wave equation expression using grid-aware evaluation
-    Literal *result_lit = expression_evaluate_grid(sim->wave_expr, sim->vars, sim->grid);
-    if (!result_lit) return;
-    
-    // Wrap result as GridField
-    GridField *result = grid_field_wrap_literal(result_lit, sim->grid);
-    
-    // Replace u_next with result
-    grid_field_free(sim->u_next);
-    sim->u_next = result;
-    
-    // Note: result_lit is now owned by the GridField, don't free it separately
-    
-    // Apply sponge layer damping
-    #pragma omp parallel for collapse(2)
-    for (uint32_t iy = 0; iy < sim->ny_total; iy++) {
-        for (uint32_t ix = 0; ix < sim->nx_total; ix++) {
-            uint32_t idx[3] = {ix, iy, 0};
-            
-            // Distance from sponge boundary
-            int dist_x_min = ix;
-            int dist_x_max = sim->nx_total - 1 - ix;
-            int dist_y_min = iy;
-            int dist_y_max = sim->ny_total - 1 - iy;
-            int min_dist = dist_x_min;
-            if (dist_x_max < min_dist) min_dist = dist_x_max;
-            if (dist_y_min < min_dist) min_dist = dist_y_min;
-            if (dist_y_max < min_dist) min_dist = dist_y_max;
-            
-            if (min_dist < sim->sponge_width) {
-                // Quadratic ramp: σ = σ_max * (1 - d/w)²
-                double d_normalized = (double)min_dist / (double)sim->sponge_width;
-                double sigma = SIGMA_MAX * (1.0 - d_normalized) * (1.0 - d_normalized);
-                
-                // Get current and previous values
-                Literal *lit_c = grid_field_get(sim->u_curr, idx);
-                Literal *lit_p = grid_field_get(sim->u_prev, idx);
-                Literal *lit_n_old = grid_field_get(sim->u_next, idx);
-                
-                double u_curr_val = lit_c ? lit_c->field[0] : 0.0;
-                double u_prev_val = lit_p ? lit_p->field[0] : 0.0;
-                double u_next_old = lit_n_old ? lit_n_old->field[0] : 0.0;
-                
-                // Free the Literals returned by grid_field_get
-                if (lit_c) literal_free(lit_c);
-                if (lit_p) literal_free(lit_p);
-                if (lit_n_old) literal_free(lit_n_old);
-                
-                // Compute acceleration from wave equation
-                double accel = u_next_old - 2.0 * u_curr_val + u_prev_val;
-                
-                // Sponge layer formula: includes damping on velocity
-                // u_next = (2 - σdt)*u_curr - (1 - σdt)*u_prev + accel
-                double u_next_val = (2.0 - sigma * sim->dt) * u_curr_val 
-                                  - (1.0 - sigma * sim->dt) * u_prev_val 
-                                  + accel;
-                
-                Literal *new_val = literal_create_scalar(u_next_val);
-                grid_field_set(sim->u_next, idx, new_val);
-                literal_free(new_val);
-            }
-        }
-    }
-    
     // Apply wave sources - compute source contributions and mask onto u_curr and u_prev
     // First, zero out the source field
     Literal *zero_lit = literal_create_scalar(0.0);
@@ -764,12 +702,80 @@ void simulation_step(SimulationState *sim) {
                     // Set u_next to source value (drives the oscillation)
                     // Don't touch u_curr or u_prev - let them evolve naturally
                     Literal *set_lit = literal_create_scalar(src_val);
-                    grid_field_set(sim->u_next, idx, set_lit);
+                    grid_field_set(sim->u_curr, idx, set_lit);
                     literal_free(set_lit);
                 }
             }
         }
     }
+    
+
+    // Update variable dictionary with current field values
+    dict_set(sim->vars, "u_curr", &sim->u_curr->data);
+    dict_set(sim->vars, "u_prev", &sim->u_prev->data);
+    
+    // Evaluate wave equation expression using grid-aware evaluation
+    Literal *result_lit = expression_evaluate_grid(sim->wave_expr, sim->vars, sim->grid);
+    if (!result_lit) return;
+    
+    // Wrap result as GridField
+    GridField *result = grid_field_wrap_literal(result_lit, sim->grid);
+    
+    // Replace u_next with result
+    grid_field_free(sim->u_next);
+    sim->u_next = result;
+        
+    // Apply sponge layer damping
+    #pragma omp parallel for collapse(2)
+    for (uint32_t iy = 0; iy < sim->ny_total; iy++) {
+        for (uint32_t ix = 0; ix < sim->nx_total; ix++) {
+            uint32_t idx[3] = {ix, iy, 0};
+            
+            // Distance from sponge boundary
+            int dist_x_min = ix;
+            int dist_x_max = sim->nx_total - 1 - ix;
+            int dist_y_min = iy;
+            int dist_y_max = sim->ny_total - 1 - iy;
+            int min_dist = dist_x_min;
+            if (dist_x_max < min_dist) min_dist = dist_x_max;
+            if (dist_y_min < min_dist) min_dist = dist_y_min;
+            if (dist_y_max < min_dist) min_dist = dist_y_max;
+            
+            if (min_dist < sim->sponge_width) {
+                // Quadratic ramp: σ = σ_max * (1 - d/w)²
+                double d_normalized = (double)min_dist / (double)sim->sponge_width;
+                double sigma = SIGMA_MAX * (1.0 - d_normalized) * (1.0 - d_normalized);
+                
+                // Get current and previous values
+                Literal *lit_c = grid_field_get(sim->u_curr, idx);
+                Literal *lit_p = grid_field_get(sim->u_prev, idx);
+                Literal *lit_n_old = grid_field_get(sim->u_next, idx);
+                
+                double u_curr_val = lit_c ? lit_c->field[0] : 0.0;
+                double u_prev_val = lit_p ? lit_p->field[0] : 0.0;
+                double u_next_old = lit_n_old ? lit_n_old->field[0] : 0.0;
+                
+                // Free the Literals returned by grid_field_get
+                if (lit_c) literal_free(lit_c);
+                if (lit_p) literal_free(lit_p);
+                if (lit_n_old) literal_free(lit_n_old);
+                
+                // Compute acceleration from wave equation
+                double accel = u_next_old - 2.0 * u_curr_val + u_prev_val;
+                
+                // Sponge layer formula: includes damping on velocity
+                // u_next = (2 - σdt)*u_curr - (1 - σdt)*u_prev + accel
+                double u_next_val = (2.0 - sigma * sim->dt) * u_curr_val 
+                                  - (1.0 - sigma * sim->dt) * u_prev_val 
+                                  + accel;
+                
+                Literal *new_val = literal_create_scalar(u_next_val);
+                grid_field_set(sim->u_next, idx, new_val);
+                literal_free(new_val);
+            }
+        }
+    }
+    
     
     // Cycle fields
     GridField *tmp = sim->u_prev;
@@ -1132,7 +1138,7 @@ void add_wave_at_position(SimulationState *sim, double phys_x, double phys_y) {
             Literal *new_val_curr = literal_create_scalar(curr_val + wave_val);
             grid_field_set(sim->u_curr, idx, new_val_curr);
             Literal *new_val_prev = literal_create_scalar(prev_val + wave_val);
-            grid_field_set(sim->u_prev, idx, new_val_prev);
+            // grid_field_set(sim->u_prev, idx, new_val_prev);
             literal_free(new_val_curr);
             literal_free(new_val_prev);
         }
@@ -1431,6 +1437,10 @@ int main(int argc, char **argv) {
                         
                         if (g_mouse_mode == MOUSE_ADD_WAVE) {
                             add_wave_at_position(sim, phys_x, phys_y);
+                            // Start wave painting mode
+                            wave_painting = 1;
+                            last_wave_x = phys_x;
+                            last_wave_y = phys_y;
                         } else if (g_mouse_mode == MOUSE_ADD_BARRIER) {
                             // Snap to cell center
                             snap_to_cell_center(sim, &phys_x, &phys_y);
@@ -1524,6 +1534,13 @@ int main(int argc, char **argv) {
                 if (event.button.button == SDL_BUTTON_LEFT) {
                     // End any active slider drag
                     menu_end_slider_drag();
+                    
+                    // End wave painting mode
+                    if (wave_painting) {
+                        wave_painting = 0;
+                        last_wave_x = -1.0;
+                        last_wave_y = -1.0;
+                    }
                     
                     // Handle barrier point deletion/dragging end
                     if (g_mouse_mode == MOUSE_ADD_BARRIER && barrier_click_candidate >= 0) {
@@ -1628,6 +1645,25 @@ int main(int argc, char **argv) {
                     if (g_show_sim_controls) menu_handle_mouse_motion(menus->sim_menu, mx, my);
                     if (selected_source && selected_source->active && menus->source_menu) {
                         menu_handle_mouse_motion(menus->source_menu, mx, my);
+                    }
+                    
+                    // Wave painting (if in ADD_WAVE mode and mouse button held)
+                    if (g_mouse_mode == MOUSE_ADD_WAVE && wave_painting && 
+                        (event.motion.state & SDL_BUTTON_LMASK)) {
+                        // Convert to physical coordinates
+                        double phys_x = ((double)mx / window_width) * sim->Lx_visible;
+                        double phys_y = (1.0 - (double)my / window_height) * sim->Ly_visible;
+                        
+                        // Only add wave if we've moved far enough from last position
+                        double dx = phys_x - last_wave_x;
+                        double dy = phys_y - last_wave_y;
+                        double dist = sqrt(dx * dx + dy * dy);
+                        
+                        if (dist >= wave_paint_spacing) {
+                            add_wave_at_position(sim, phys_x, phys_y);
+                            last_wave_x = phys_x;
+                            last_wave_y = phys_y;
+                        }
                     }
                     
                     // Source dragging (if in SOURCE mode and not over menus)
