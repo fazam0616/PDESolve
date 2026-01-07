@@ -652,9 +652,9 @@ void simulation_step(SimulationState *sim) {
                 double y = iy * sim->dy;
                 double dx = x - src_x_full;
                 double dy = y - src_y_full;
-                double dist = sqrt(dx * dx + dy * dy);
-                
-                if (dist <= src->radius) {
+                double dist = (dx * dx + dy * dy);
+
+                if (dist <= src->radius * src->radius) {
                     // Within source radius - set to source value
                     uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
                     Literal *src_val = literal_create_scalar(source_value);
@@ -689,9 +689,9 @@ void simulation_step(SimulationState *sim) {
                 double y = iy * sim->dy;
                 double dx = x - src_x_full;
                 double dy = y - src_y_full;
-                double dist = sqrt(dx * dx + dy * dy);
-                
-                if (dist <= src->radius) {
+                double dist = (dx * dx + dy * dy);
+
+                if (dist <= src->radius*src->radius) {
                     uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
                     
                     // Get source value
