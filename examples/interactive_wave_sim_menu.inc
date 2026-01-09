@@ -169,22 +169,37 @@ void on_reset_clicked(VariableInteraction *vi, void *user_data) {
 void on_timestep_changed(VariableInteraction *vi, void *user_data) {
     (void)vi;  // Unused
     SimulationState *sim = (SimulationState*)user_data;
-    double cfl = sim->wave_speed * sim->dt / fmin(sim->dx, sim->dy);
+    /* Estimate a CFL using the configured impulse strength as a proxy for max velocity */
+    double cfl = sim->velocity_impulse_strength * sim->dt / fmin(sim->dx, sim->dy);
     if (cfl > 0.7) {
         printf("WARNING: CFL = %.4f may be unstable!\n", cfl);
     }
 }
 
 // Radio button callbacks for render mode
-void on_render_height_selected(VariableInteraction *vi, void *user_data) {
+void on_render_pressure_selected(VariableInteraction *vi, void *user_data) {
     (void)vi;
     RenderState *render = (RenderState*)user_data;
-    if (render->mode_height) {
-        render->mode = RENDER_HEIGHT;
-        render->mode_height = 1;
+    if (render->mode_pressure) {
+        render->mode = RENDER_PRESSURE;
+        render->mode_pressure = 1;
         render->mode_velocity = 0;
+        render->mode_vorticity = 0;
         render->mode_rgb = 0;
-        printf("Render mode: HEIGHT\n");
+        printf("Render mode: PRESSURE\n");
+    }
+}
+
+void on_render_vorticity_selected(VariableInteraction *vi, void *user_data) {
+    (void)vi;
+    RenderState *render = (RenderState*)user_data;
+    if (render->mode_vorticity) {
+        render->mode = RENDER_VORTICITY;
+        render->mode_pressure = 0;
+        render->mode_velocity = 0;
+        render->mode_vorticity = 1;
+        render->mode_rgb = 0;
+        printf("Render mode: VORTICITY\n");
     }
 }
 
@@ -193,9 +208,10 @@ void on_render_velocity_selected(VariableInteraction *vi, void *user_data) {
     RenderState *render = (RenderState*)user_data;
     if (render->mode_velocity) {
         render->mode = RENDER_VELOCITY;
-        render->mode_height = 0;
+    render->mode_pressure = 0;
         render->mode_velocity = 1;
-        render->mode_rgb = 0;
+    render->mode_vorticity = 0;
+    render->mode_rgb = 0;
         printf("Render mode: VELOCITY\n");
     }
 }
@@ -205,7 +221,7 @@ void on_render_rgb_selected(VariableInteraction *vi, void *user_data) {
     RenderState *render = (RenderState*)user_data;
     if (render->mode_rgb) {
         render->mode = RENDER_RGB;
-        render->mode_height = 0;
+    render->mode_pressure = 0;
         render->mode_velocity = 0;
         render->mode_rgb = 1;
         printf("Render mode: RGB\n");
@@ -219,7 +235,7 @@ void on_mouse_none_selected(VariableInteraction *vi, void *user_data) {
     if (g_mouse_none) {
         g_mouse_mode = MOUSE_NONE;
         g_mouse_none = 1;
-        g_mouse_add_wave = 0;
+    g_mouse_add_velocity = 0;
         g_mouse_add_barrier = 0;
         g_mouse_source = 0;
         
@@ -240,10 +256,10 @@ void on_mouse_none_selected(VariableInteraction *vi, void *user_data) {
 void on_mouse_add_wave_selected(VariableInteraction *vi, void *user_data) {
     (void)vi;
     (void)user_data;
-    if (g_mouse_add_wave) {
-        g_mouse_mode = MOUSE_ADD_WAVE;
+    if (g_mouse_add_velocity) {
+        g_mouse_mode = MOUSE_ADD_VELOCITY;
         g_mouse_none = 0;
-        g_mouse_add_wave = 1;
+        g_mouse_add_velocity = 1;
         g_mouse_add_barrier = 0;
         g_mouse_source = 0;
         
@@ -257,7 +273,7 @@ void on_mouse_add_wave_selected(VariableInteraction *vi, void *user_data) {
         dragging_barrier_idx = -1;
         barrier_click_candidate = -1;
         
-        printf("Mode: ADD_WAVE\n");
+    printf("Mode: ADD_VELOCITY\n");
     }
 }
 
@@ -267,7 +283,7 @@ void on_mouse_add_barrier_selected(VariableInteraction *vi, void *user_data) {
     if (g_mouse_add_barrier) {
         g_mouse_mode = MOUSE_ADD_BARRIER;
         g_mouse_none = 0;
-        g_mouse_add_wave = 0;
+    g_mouse_add_velocity = 0;
         g_mouse_add_barrier = 1;
         g_mouse_source = 0;
         
@@ -292,7 +308,7 @@ void on_mouse_source_selected(VariableInteraction *vi, void *user_data) {
     if (g_mouse_source) {
         g_mouse_mode = MOUSE_SOURCE;
         g_mouse_none = 0;
-        g_mouse_add_wave = 0;
+    g_mouse_add_velocity = 0;
         g_mouse_add_barrier = 0;
         g_mouse_source = 1;
         
@@ -423,13 +439,13 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
     // Mouse controls submenu - 2x2 grid for mode toggles
     menus->mouse_menu = menu_create(270, 10, 250, 230, 1, "Mouse Controls", textColor, bgColor);
     
-    // Row 1: None and Add Wave
+    // Row 1: None and Add Velocity
     MenuRow *m_row1 = menurow_create();
     menurow_add_interaction(m_row1,
         variableinteraction_create(&g_mouse_none, "None", 0, 1, VAR_BOOL,
                                   on_mouse_none_selected, NULL));
     menurow_add_interaction(m_row1,
-        variableinteraction_create(&g_mouse_add_wave, "Add Wave", 0, 1, VAR_BOOL,
+        variableinteraction_create(&g_mouse_add_velocity, "Add Velocity", 0, 1, VAR_BOOL,
                                   on_mouse_add_wave_selected, NULL));
     menu_add_row(menus->mouse_menu, m_row1);
     
@@ -443,17 +459,17 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
                                   on_mouse_source_selected, NULL));
     menu_add_row(menus->mouse_menu, m_row2);
     
-    // Row 3: Amplitude slider
+    // Row 3: Impulse Strength slider
     MenuRow *m_row3 = menurow_create();
     menurow_add_interaction(m_row3,
-        variableinteraction_create(&sim->wave_amplitude, "Amplitude", -0.1, 0.1, VAR_SLIDER,
+        variableinteraction_create(&sim->velocity_impulse_strength, "Impulse Strength", 0.0, 50.0, VAR_SLIDER,
                                   NULL, NULL));
     menu_add_row(menus->mouse_menu, m_row3);
     
     // Row 4: Spread slider
     MenuRow *m_row4 = menurow_create();
     menurow_add_interaction(m_row4,
-        variableinteraction_create(&sim->wave_spread, "Spread", 0.01, 0.2, VAR_SLIDER,
+        variableinteraction_create(&sim->velocity_impulse_radius, "Impulse Radius", 0.001, 1.0, VAR_SLIDER,
                                   NULL, NULL));
     menu_add_row(menus->mouse_menu, m_row4);
     
@@ -494,8 +510,8 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
     
     MenuRow *s_row3 = menurow_create();
     menurow_add_interaction(s_row3,
-        variableinteraction_create(&sim->wave_speed, "Wave Speed", 0.1, 20.0, VAR_SLIDER,
-                                  NULL, NULL));
+    variableinteraction_create(&sim->viscosity, "Viscosity", 0.0, 1.0, VAR_SLIDER,
+                  NULL, NULL));
     menu_add_row(menus->sim_menu, s_row3);
     
     MenuRow *s_row4 = menurow_create();
@@ -536,21 +552,27 @@ Menus* initialize_menus(SimulationState *sim, RenderState *render) {
     
     MenuRow *s_row10 = menurow_create();
     menurow_add_interaction(s_row10,
-        variableinteraction_create(&render->mode_height, "Mode: Height", 0, 1, VAR_BOOL,
-                                  on_render_height_selected, render));
+        variableinteraction_create(&render->mode_pressure, "Mode: Pressure", 0, 1, VAR_BOOL,
+                                  on_render_pressure_selected, render));
     menu_add_row(menus->sim_menu, s_row10);
-    
+
     MenuRow *s_row11 = menurow_create();
     menurow_add_interaction(s_row11,
         variableinteraction_create(&render->mode_velocity, "Mode: Velocity", 0, 1, VAR_BOOL,
                                   on_render_velocity_selected, render));
     menu_add_row(menus->sim_menu, s_row11);
-    
+
     MenuRow *s_row12 = menurow_create();
     menurow_add_interaction(s_row12,
+        variableinteraction_create(&render->mode_vorticity, "Mode: Vorticity", 0, 1, VAR_BOOL,
+                                  on_render_vorticity_selected, render));
+    menu_add_row(menus->sim_menu, s_row12);
+
+    MenuRow *s_row13 = menurow_create();
+    menurow_add_interaction(s_row13,
         variableinteraction_create(&render->mode_rgb, "Mode: RGB", 0, 1, VAR_BOOL,
                                   on_render_rgb_selected, render));
-    menu_add_row(menus->sim_menu, s_row12);
+    menu_add_row(menus->sim_menu, s_row13);
     
     return menus;
 }

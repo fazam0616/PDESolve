@@ -1,12 +1,12 @@
 /*
- * Interactive 2D Wave Simulator with OpenGL Rendering
+ * Interactive 2D Fluid Simulator with OpenGL Rendering
  * 
  * Features:
  * - Real-time OpenGL rendering at fixed ~60 FPS
- * - Decoupled physics simulation (runs as fast as possible)
+ * - Navier-Stokes fluid simulation using projection method
  * - Interactive menu system for runtime parameter adjustment
- * - Multiple render modes (height, velocity, RGB)
- * - Mouse interaction modes (add waves, barriers)
+ * - Multiple render modes (pressure, velocity, vorticity)
+ * - Mouse interaction modes (add velocity, barriers, sources)
  * - Simulation controls (play/pause, reset, step size)
  * - Sponge layer boundary absorption
  */
@@ -24,6 +24,7 @@
 #include "../include/Menu.h"
 #include "../include/expression.h"
 #include "../include/dictionary.h"
+#include "../include/solver.h"
 
 // =============================================================================
 // Constants and Configuration
@@ -36,17 +37,18 @@
 
 // Render modes
 typedef enum {
-    RENDER_HEIGHT,      // Blue for negative, red for positive
+    RENDER_PRESSURE,    // Blue for negative (low), red for positive (high)
     RENDER_VELOCITY,    // Grayscale velocity magnitude
-    RENDER_RGB          // R=vx, G=vy, B=height
+    RENDER_VORTICITY,   // Vorticity (curl of velocity field)
+    RENDER_RGB          // R=vx, G=vy, B=pressure
 } RenderMode;
 
 // Mouse interaction modes
 typedef enum {
     MOUSE_NONE,         // No interaction
-    MOUSE_ADD_WAVE,     // Click or drag to add wave pulses
+    MOUSE_ADD_VELOCITY, // Click or drag to add velocity impulses
     MOUSE_ADD_BARRIER,  // Click to add reflecting barriers (line segments)
-    MOUSE_SOURCE        // Click to add/select/move oscillating wave sources
+    MOUSE_SOURCE        // Click to add/select/move velocity sources
 } MouseMode;
 
 // Barrier point storage
@@ -93,14 +95,25 @@ static WaveSource *last_menu_source = NULL; // Track which source the menu was l
 typedef struct {
     // Grid and fields
     GridMetadata *grid;
-    GridField *u_curr;      // Current wave height
-    GridField *u_prev;      // Previous wave height
-    GridField *u_next;      // Next wave height (workspace)
-    GridField *u_source;    // Source contributions (sinusoidal drivers)
+    GridField *vx_curr;     // Current x-velocity
+    GridField *vy_curr;     // Current y-velocity
+    GridField *vx_next;     // Next x-velocity (workspace)
+    GridField *vy_next;     // Next y-velocity (workspace)
+    GridField *pressure;    // Pressure field
+    GridField *divergence;  // Velocity divergence (workspace)
+    GridField *vx_source;   // Velocity source contributions
+    GridField *vy_source;
     
-    // Expression system for wave equation evaluation
-    Expression *wave_expr;  // Compiled expression: 2*u_curr - u_prev + c²*dt²*∇²u_curr
-    Dictionary *vars;       // Variable dictionary for evaluation
+    // PDE System for pressure solve
+    PDESystem *pressure_system;
+    
+    // Expression system for fluid equations
+    Expression *advect_vx_expr;   // Advection term for vx
+    Expression *advect_vy_expr;   // Advection term for vy
+    Expression *diffuse_vx_expr;  // Diffusion term for vx: ν∇²vx
+    Expression *diffuse_vy_expr;  // Diffusion term for vy: ν∇²vy
+    Expression *divergence_expr;  // Divergence: ∂vx/∂x + ∂vy/∂y
+    Dictionary *vars;             // Variable dictionary for evaluation
     
     // Physical parameters (visible region)
     double Lx_visible;      // Visible domain width
@@ -118,13 +131,14 @@ typedef struct {
     
     // Simulation parameters
     double dt;              // Time step
-    double wave_speed;      // Wave propagation speed
+    double viscosity;       // Kinematic viscosity (ν)
+    double density;         // Fluid density (ρ)
     double max_sim_speed;   // Maximum simulation steps per second (0 = unlimited)
     int paused;             // Simulation paused flag
     
     // Mouse interaction parameters
-    double wave_amplitude;  // Amplitude for added waves
-    double wave_spread;     // Spread (sigma) for Gaussian waves
+    double velocity_impulse_strength;  // Strength for added velocity
+    double velocity_impulse_radius;    // Radius for velocity impulses
     
     // Statistics
     double sim_time;        // Total simulated time
@@ -137,9 +151,9 @@ typedef struct {
     uint64_t steps_since_last_update;
     
     // Energy tracking
-    double total_energy;        // Current total energy in the system
-    double baseline_energy;     // Expected/initial energy (tracked from waves added)
-    double energy_error;        // Relative error: (current - baseline) / baseline
+    double total_energy;        // Current total kinetic energy in the system
+    double baseline_energy;     // Expected/initial energy
+    double energy_error;        // Relative error
 } SimulationState;
 
 // =============================================================================
@@ -153,8 +167,9 @@ typedef struct {
     int show_stats;         // Render statistics overlay
     
     // Radio button states for render mode
-    int mode_height;
+    int mode_pressure;
     int mode_velocity;
+    int mode_vorticity;
     int mode_rgb;
 } RenderState;
 
@@ -168,7 +183,7 @@ static RenderState *g_render = NULL;
 // Mouse mode state (radio button group)
 static MouseMode g_mouse_mode = MOUSE_NONE;
 static int g_mouse_none = 1;
-static int g_mouse_add_wave = 0;
+static int g_mouse_add_velocity = 0;
 static int g_mouse_add_barrier = 0;
 static int g_mouse_source = 0;
 
@@ -179,10 +194,10 @@ static double g_default_source_frequency = 5.0;
 static double g_default_source_phase = 0.0;
 
 // Wave painting state (for drag support)
-static int wave_painting = 0;           // Is user currently painting waves?
-static double last_wave_x = -1.0;       // Last position where wave was added
-static double last_wave_y = -1.0;
-static double wave_paint_spacing = 0.1; // Minimum distance between waves (physical units)
+static int velocity_painting = 0;       // Is user currently painting velocity?
+static double last_velocity_x = -1.0;   // Last position where velocity was added
+static double last_velocity_y = -1.0;
+static double velocity_paint_spacing = 0.1; // Minimum distance between impulses (physical units)
 
 // Centralized menu slider drag state
 typedef struct {
@@ -202,7 +217,7 @@ static MenuDragState g_menu_drag_state = {
 // Mouse mode names for display
 static const char* g_mouse_mode_names[] = {
     "NONE",
-    "WAVE",
+    "VELOCITY",
     "BARRIER",
     "SOURCE"
 };
@@ -243,21 +258,21 @@ Literal* init_gaussian_centered(const double *coords, int n_dims) {
     return literal_create_scalar(value);
 }
 
-// Forward declarations for energy functions
-double calculate_total_energy(SimulationState *sim);
-double calculate_interaction_energy(SimulationState *sim, double phys_x, double phys_y, double amplitude, double sigma);
-double estimate_wave_energy(SimulationState *sim, double amplitude, double sigma);
+// Forward declaration for energy function
+double calculate_kinetic_energy(SimulationState *sim);
 
 // Reset simulation to initial state
 void reset_simulation(SimulationState *sim) {
-    // grid_field_init_from_function(sim->u_curr, init_gaussian_centered);
-    // grid_field_init_from_function(sim->u_prev, init_gaussian_centered);
-    
-    // Fill u_next with zeros
+    // Fill all fields with zeros
     Literal *zero = literal_create_scalar(0.0);
-    grid_field_fill(sim->u_next, zero);
-    grid_field_fill(sim->u_prev, zero);
-    grid_field_fill(sim->u_curr, zero);
+    grid_field_fill(sim->vx_curr, zero);
+    grid_field_fill(sim->vy_curr, zero);
+    grid_field_fill(sim->vx_next, zero);
+    grid_field_fill(sim->vy_next, zero);
+    grid_field_fill(sim->pressure, zero);
+    grid_field_fill(sim->divergence, zero);
+    grid_field_fill(sim->vx_source, zero);
+    grid_field_fill(sim->vy_source, zero);
     literal_free(zero);
     
     sim->sim_time = 0.0;
@@ -266,11 +281,11 @@ void reset_simulation(SimulationState *sim) {
     sim->last_step_time = SDL_GetTicks() / 1000.0;
     
     // Calculate baseline energy from initial conditions
-    sim->baseline_energy = calculate_total_energy(sim);
-    sim->total_energy = sim->baseline_energy;
+    sim->baseline_energy = 0.0;  // No initial kinetic energy
+    sim->total_energy = 0.0;
     sim->energy_error = 0.0;
     
-    printf("Initial energy: %.6f\n", sim->baseline_energy);
+    printf("Fluid simulation reset\n");
 }
 
 // Create simulation state with given parameters
@@ -308,47 +323,47 @@ SimulationState* simulation_create(double Lx_vis, double Ly_vis, int nx_vis, int
     grid_set_boundary(sim->grid, 1, 1, BC_OPEN, 0.0);  // Top
     
     // Create fields
-    sim->u_curr = grid_field_create(sim->grid);
-    sim->u_prev = grid_field_create(sim->grid);
-    sim->u_next = grid_field_create(sim->grid);
-    sim->u_source = grid_field_create(sim->grid);  // Source contributions
+    sim->vx_curr = grid_field_create(sim->grid);
+    sim->vy_curr = grid_field_create(sim->grid);
+    sim->vx_next = grid_field_create(sim->grid);
+    sim->vy_next = grid_field_create(sim->grid);
+    sim->pressure = grid_field_create(sim->grid);
+    sim->divergence = grid_field_create(sim->grid);
+    sim->vx_source = grid_field_create(sim->grid);
+    sim->vy_source = grid_field_create(sim->grid);
     
     // Simulation parameters
-    sim->dt = 0.004;
-    sim->wave_speed = 1.0;
-    sim->max_sim_speed = 2000.0;  // Default max 2000 steps/sec
+    sim->dt = 0.01;
+    sim->viscosity = 0.001;  // Kinematic viscosity
+    sim->density = 1.0;      // Fluid density
+    sim->max_sim_speed = 1000.0;  // Default max 1000 steps/sec
     sim->paused = 0;
     
     // Mouse interaction parameters
-    sim->wave_amplitude = 0.3;  // Default amplitude
-    sim->wave_spread = 0.05;  // Default spread in physical units
+    sim->velocity_impulse_strength = 5.0;  // Default impulse strength
+    sim->velocity_impulse_radius = 0.05;   // Default radius in physical units
     
-    // Build wave equation expression: u_next = 2*u_curr - u_prev + c²*dt²*∇²u_curr
-    // Use expr_laplacian for proper second-order derivative handling
-    Expression *u_curr_var = expr_variable("u_curr");
-    Expression *u_prev_var = expr_variable("u_prev");
+    // Build fluid equation expressions
+    // For now, just diffusion: ν∇²v (advection will be computed numerically in step)
+    Expression *laplacian_vx = expr_laplacian(expr_variable("vx"));
+    Expression *laplacian_vy = expr_laplacian(expr_variable("vy"));
     
-    // Laplacian: ∇²u_curr (uses grid_field_laplacian internally - order=2 derivatives)
-    Expression *laplacian = expr_laplacian(expr_variable("u_curr"));
+    sim->diffuse_vx_expr = expr_multiply(expr_literal(literal_create_scalar(sim->viscosity)), laplacian_vx);
+    sim->diffuse_vy_expr = expr_multiply(expr_literal(literal_create_scalar(sim->viscosity)), laplacian_vy);
     
-    // c²*dt²*∇²u_curr
-    double c2_dt2 = sim->wave_speed * sim->wave_speed * sim->dt * sim->dt;
-    Expression *c2dt2_lit = expr_literal(literal_create_scalar(c2_dt2));
-    Expression *accel_term = expr_multiply(c2dt2_lit, laplacian);
+    // Advection terms: will be computed numerically in simulation_step
+    sim->advect_vx_expr = NULL;  // Not used for now
+    sim->advect_vy_expr = NULL;  // Not used for now
     
-    // 2*u_curr
-    Expression *two_lit = expr_literal(literal_create_scalar(2.0));
-    Expression *two_u_curr = expr_multiply(two_lit, u_curr_var);
+    // Divergence: We'll compute this numerically too
+    sim->divergence_expr = NULL;  // Not used for now
     
-    // 2*u_curr - u_prev
-    Expression *neg_u_prev = expr_negate(u_prev_var);
-    Expression *diff = expr_add(two_u_curr, neg_u_prev);
+    // Create PDE system for pressure solve: ∇²p = ρ/dt * ∇·v*
+    // This will be set up during simulation step
+    sim->pressure_system = NULL;
     
-    // Final: 2*u_curr - u_prev + c²*dt²*∇²u_curr
-    sim->wave_expr = expr_add(diff, accel_term);
-    
-    // Create variable dictionary (capacity for u_curr and u_prev)
-    sim->vars = dict_create(8);
+    // Create variable dictionary
+    sim->vars = dict_create(16);
     
     // Initialize fields
     g_sim = sim;  // Set global for init function
@@ -361,39 +376,44 @@ SimulationState* simulation_create(double Lx_vis, double Ly_vis, int nx_vis, int
            sim->sponge_width, SPONGE_WIDTH_PERCENT * 100.0);
     printf("  Total: %dx%d (with sponge)\n", sim->nx_total, sim->ny_total);
     printf("  Spacing: dx=%.4f, dy=%.4f\n", sim->dx, sim->dy);
-    printf("  CFL = %.4f (should be < 0.707)\n", 
-           sim->wave_speed * sim->dt / fmin(sim->dx, sim->dy));
+    printf("  Viscosity: %.6f, Density: %.2f\n", sim->viscosity, sim->density);
+    printf("  dt: %.6f\n", sim->dt);
     
     return sim;
 }
 
 void simulation_free(SimulationState *sim) {
     if (!sim) return;
-    grid_field_free(sim->u_curr);
-    grid_field_free(sim->u_prev);
-    grid_field_free(sim->u_next);
-    grid_field_free(sim->u_source);
+    grid_field_free(sim->vx_curr);
+    grid_field_free(sim->vy_curr);
+    grid_field_free(sim->vx_next);
+    grid_field_free(sim->vy_next);
+    grid_field_free(sim->pressure);
+    grid_field_free(sim->divergence);
+    grid_field_free(sim->vx_source);
+    grid_field_free(sim->vy_source);
     grid_metadata_free(sim->grid);
-    if (sim->wave_expr) expression_free(sim->wave_expr);
+    if (sim->advect_vx_expr) expression_free(sim->advect_vx_expr);
+    if (sim->advect_vy_expr) expression_free(sim->advect_vy_expr);
+    if (sim->diffuse_vx_expr) expression_free(sim->diffuse_vx_expr);
+    if (sim->diffuse_vy_expr) expression_free(sim->diffuse_vy_expr);
+    if (sim->divergence_expr) expression_free(sim->divergence_expr);
+    if (sim->pressure_system) pde_system_free(sim->pressure_system);
     if (sim->vars) dict_free(sim->vars);
     free(sim);
 }
 
 // =============================================================================
-// Energy Calculation
+// Energy Calculation (TODO: Update for fluid dynamics)
 // =============================================================================
 
-// Calculate total energy in the wave field
-// E = ∫(1/2 * v² + 1/2 * c² * |∇u|²) dV
-// where v = (u_curr - u_prev) / dt is velocity
-// and |∇u|² is the gradient magnitude squared
-double calculate_total_energy(SimulationState *sim) {
+// Calculate total kinetic energy in the fluid
+// E = (1/2) * ρ * ∫(vx² + vy²) dV
+double calculate_kinetic_energy(SimulationState *sim) {
     double total = 0.0;
-    double c_squared = sim->wave_speed * sim->wave_speed;
-    double dt = sim->dt;
-    double dV = sim->dx * sim->dy;  // Volume element (area in 2D)
+    double dV = sim->dx * sim->dy;
     
-    // Only calculate over visible region to avoid counting sponge damping
+    // Only calculate over visible region
     int start_x = sim->sponge_width;
     int end_x = sim->nx_total - sim->sponge_width;
     int start_y = sim->sponge_width;
@@ -404,275 +424,55 @@ double calculate_total_energy(SimulationState *sim) {
         for (int ix = start_x; ix < end_x; ix++) {
             uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
             
-            // Get current and previous values
-            Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-            Literal *lit_prev = grid_field_get(sim->u_prev, idx);
-            double u_curr = lit_curr->field[0];
-            double u_prev = lit_prev->field[0];
-            literal_free(lit_curr);
-            literal_free(lit_prev);
+            Literal *lit_vx = grid_field_get(sim->vx_curr, idx);
+            Literal *lit_vy = grid_field_get(sim->vy_curr, idx);
+            double vx = lit_vx ? lit_vx->field[0] : 0.0;
+            double vy = lit_vy ? lit_vy->field[0] : 0.0;
+            if (lit_vx) literal_free(lit_vx);
+            if (lit_vy) literal_free(lit_vy);
             
-            // Kinetic energy: 1/2 * v²
-            double velocity = (u_curr - u_prev) / dt;
-            double kinetic = 0.5 * velocity * velocity;
-            
-            // Potential energy: 1/2 * c² * |∇u|²
-            // Compute gradient using central/one-sided differences
-            double grad_x = 0.0;
-            double grad_y = 0.0;
-            
-            if (ix > start_x && ix < end_x - 1) {
-                // Central difference (most accurate)
-                uint32_t idx_xp[3] = {(uint32_t)(ix + 1), (uint32_t)iy, 0};
-                uint32_t idx_xm[3] = {(uint32_t)(ix - 1), (uint32_t)iy, 0};
-                Literal *lit_xp = grid_field_get(sim->u_curr, idx_xp);
-                Literal *lit_xm = grid_field_get(sim->u_curr, idx_xm);
-                grad_x = (lit_xp->field[0] - lit_xm->field[0]) / (2.0 * sim->dx);
-                literal_free(lit_xp);
-                literal_free(lit_xm);
-            } else if (ix == start_x) {
-                // One-sided forward difference at left boundary
-                uint32_t idx_xp[3] = {(uint32_t)(ix + 1), (uint32_t)iy, 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_xp = grid_field_get(sim->u_curr, idx_xp);
-                grad_x = (lit_xp->field[0] - lit_curr->field[0]) / sim->dx;
-                literal_free(lit_curr);
-                literal_free(lit_xp);
-            } else if (ix == end_x - 1) {
-                // One-sided backward difference at right boundary
-                uint32_t idx_xm[3] = {(uint32_t)(ix - 1), (uint32_t)iy, 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_xm = grid_field_get(sim->u_curr, idx_xm);
-                grad_x = (lit_curr->field[0] - lit_xm->field[0]) / sim->dx;
-                literal_free(lit_curr);
-                literal_free(lit_xm);
-            }
-            
-            if (iy > start_y && iy < end_y - 1) {
-                // Central difference (most accurate)
-                uint32_t idx_yp[3] = {(uint32_t)ix, (uint32_t)(iy + 1), 0};
-                uint32_t idx_ym[3] = {(uint32_t)ix, (uint32_t)(iy - 1), 0};
-                Literal *lit_yp = grid_field_get(sim->u_curr, idx_yp);
-                Literal *lit_ym = grid_field_get(sim->u_curr, idx_ym);
-                grad_y = (lit_yp->field[0] - lit_ym->field[0]) / (2.0 * sim->dy);
-                literal_free(lit_yp);
-                literal_free(lit_ym);
-            } else if (iy == start_y) {
-                // One-sided forward difference at bottom boundary
-                uint32_t idx_yp[3] = {(uint32_t)ix, (uint32_t)(iy + 1), 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_yp = grid_field_get(sim->u_curr, idx_yp);
-                grad_y = (lit_yp->field[0] - lit_curr->field[0]) / sim->dy;
-                literal_free(lit_curr);
-                literal_free(lit_yp);
-            } else if (iy == end_y - 1) {
-                // One-sided backward difference at top boundary
-                uint32_t idx_ym[3] = {(uint32_t)ix, (uint32_t)(iy - 1), 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_ym = grid_field_get(sim->u_curr, idx_ym);
-                grad_y = (lit_curr->field[0] - lit_ym->field[0]) / sim->dy;
-                literal_free(lit_curr);
-                literal_free(lit_ym);
-            }
-            
-            double grad_sq = grad_x * grad_x + grad_y * grad_y;
-            double potential = 0.5 * c_squared * grad_sq;
-            
-            // Add to total energy
-            total += (kinetic + potential) * dV;
+            double v_sq = vx * vx + vy * vy;
+            total += 0.5 * sim->density * v_sq * dV;
         }
     }
     
     return total;
 }
 
-// Calculate interaction energy between new Gaussian wave and existing field
-// E_interaction = c² ∫∫ ∇u_old · ∇u_new dV
-double calculate_interaction_energy(SimulationState *sim, double phys_x, double phys_y, 
-                                   double amplitude, double sigma) {
-    double c_squared = sim->wave_speed * sim->wave_speed;
-    double dV = sim->dx * sim->dy;
-    double sigma_squared = sigma * sigma;
-    
-    double offset_x = sim->sponge_width * sim->dx;
-    double offset_y = sim->sponge_width * sim->dy;
-    
-    // Center of new Gaussian in full grid coordinates
-    double center_x = phys_x + offset_x;
-    double center_y = phys_y + offset_y;
-    
-    double interaction = 0.0;
-    
-    // Compute over visible region only
-    int start_x = sim->sponge_width;
-    int end_x = sim->nx_total - sim->sponge_width;
-    int start_y = sim->sponge_width;
-    int end_y = sim->ny_total - sim->sponge_width;
-    
-    #pragma omp parallel for collapse(2) reduction(+:interaction)
-    for (int iy = start_y; iy < end_y; iy++) {
-        for (int ix = start_x; ix < end_x; ix++) {
-            uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
-            
-            // Grid position
-            double x = ix * sim->dx;
-            double y = iy * sim->dy;
-            
-            // Vector from Gaussian center to this point
-            double dx_from_center = x - center_x;
-            double dy_from_center = y - center_y;
-            double r_squared = dx_from_center * dx_from_center + dy_from_center * dy_from_center;
-            
-            // Gradient of old field (numerical - central differences)
-            double grad_u_old_x = 0.0;
-            double grad_u_old_y = 0.0;
-            
-            if (ix > start_x && ix < end_x - 1) {
-                uint32_t idx_xp[3] = {(uint32_t)(ix + 1), (uint32_t)iy, 0};
-                uint32_t idx_xm[3] = {(uint32_t)(ix - 1), (uint32_t)iy, 0};
-                Literal *lit_xp = grid_field_get(sim->u_curr, idx_xp);
-                Literal *lit_xm = grid_field_get(sim->u_curr, idx_xm);
-                grad_u_old_x = (lit_xp->field[0] - lit_xm->field[0]) / (2.0 * sim->dx);
-                literal_free(lit_xp);
-                literal_free(lit_xm);
-            } else if (ix == start_x) {
-                uint32_t idx_xp[3] = {(uint32_t)(ix + 1), (uint32_t)iy, 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_xp = grid_field_get(sim->u_curr, idx_xp);
-                grad_u_old_x = (lit_xp->field[0] - lit_curr->field[0]) / sim->dx;
-                literal_free(lit_curr);
-                literal_free(lit_xp);
-            } else if (ix == end_x - 1) {
-                uint32_t idx_xm[3] = {(uint32_t)(ix - 1), (uint32_t)iy, 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_xm = grid_field_get(sim->u_curr, idx_xm);
-                grad_u_old_x = (lit_curr->field[0] - lit_xm->field[0]) / sim->dx;
-                literal_free(lit_curr);
-                literal_free(lit_xm);
-            }
-            
-            if (iy > start_y && iy < end_y - 1) {
-                uint32_t idx_yp[3] = {(uint32_t)ix, (uint32_t)(iy + 1), 0};
-                uint32_t idx_ym[3] = {(uint32_t)ix, (uint32_t)(iy - 1), 0};
-                Literal *lit_yp = grid_field_get(sim->u_curr, idx_yp);
-                Literal *lit_ym = grid_field_get(sim->u_curr, idx_ym);
-                grad_u_old_y = (lit_yp->field[0] - lit_ym->field[0]) / (2.0 * sim->dy);
-                literal_free(lit_yp);
-                literal_free(lit_ym);
-            } else if (iy == start_y) {
-                uint32_t idx_yp[3] = {(uint32_t)ix, (uint32_t)(iy + 1), 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_yp = grid_field_get(sim->u_curr, idx_yp);
-                grad_u_old_y = (lit_yp->field[0] - lit_curr->field[0]) / sim->dy;
-                literal_free(lit_curr);
-                literal_free(lit_yp);
-            } else if (iy == end_y - 1) {
-                uint32_t idx_ym[3] = {(uint32_t)ix, (uint32_t)(iy - 1), 0};
-                Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-                Literal *lit_ym = grid_field_get(sim->u_curr, idx_ym);
-                grad_u_old_y = (lit_curr->field[0] - lit_ym->field[0]) / sim->dy;
-                literal_free(lit_curr);
-                literal_free(lit_ym);
-            }
-            
-            // Gradient of new Gaussian (analytical)
-            // ∇u_new = -(A/σ²) * r_vec * exp(-r²/(2σ²))
-            double exp_term = exp(-r_squared / (2.0 * sigma_squared));
-            double grad_u_new_x = -(amplitude / sigma_squared) * dx_from_center * exp_term;
-            double grad_u_new_y = -(amplitude / sigma_squared) * dy_from_center * exp_term;
-            
-            // Dot product: ∇u_old · ∇u_new
-            double dot_product = grad_u_old_x * grad_u_new_x + grad_u_old_y * grad_u_new_y;
-            
-            // Accumulate interaction energy
-            interaction += dot_product * dV;
-        }
-    }
-    
-    // Multiply by c²
-    return c_squared * interaction;
-}
-
-// Estimate self-energy of a Gaussian wave pulse
-double estimate_wave_energy(SimulationState *sim, double amplitude, double sigma) {
-    // For a Gaussian pulse: u(x,y) = A * exp(-(x²+y²)/(2σ²))
-    // Self-energy (analytical): E_self = (π/2) * c² * A²
-    // This is independent of σ for a fixed amplitude A
-    double c_squared = sim->wave_speed * sim->wave_speed;
-    double E_self = (M_PI / 2.0) * c_squared * amplitude * amplitude;
-    
-    return E_self;
-}
-
 // =============================================================================
-// Simulation Step
+// Simulation Step - Navier-Stokes Fluid Simulation
 // =============================================================================
 
 void simulation_step(SimulationState *sim) {
     if (sim->paused) return;
     
-    // Apply wave sources - compute source contributions and mask onto u_curr and u_prev
-    // First, zero out the source field
-    Literal *zero_lit = literal_create_scalar(0.0);
-    grid_field_fill(sim->u_source, zero_lit);
-    literal_free(zero_lit);
-    
-    // Compute source contributions
     double offset_x = sim->sponge_width * sim->dx;
     double offset_y = sim->sponge_width * sim->dy;
     
+    // ===========================================================================
+    // STEP 1: Apply velocity sources
+    // ===========================================================================
+    
+    // Zero out source fields
+    Literal *zero_lit = literal_create_scalar(0.0);
+    grid_field_fill(sim->vx_source, zero_lit);
+    grid_field_fill(sim->vy_source, zero_lit);
+    literal_free(zero_lit);
+    
+    // Apply velocity sources (convert wave sources to velocity sources)
     for (int src_idx = 0; src_idx < n_wave_sources; src_idx++) {
         if (!wave_sources[src_idx].active) continue;
         
         WaveSource *src = &wave_sources[src_idx];
         
-        // Convert source position to full grid coordinates
         double src_x_full = src->x + offset_x;
         double src_y_full = src->y + offset_y;
         
-        // Source value: amplitude * sin(2π * frequency * time + phase)
+        // Source velocity: creates swirling/pulsing motion
         double omega = 2.0 * M_PI * src->frequency;
-        double source_value = src->amplitude * sin(omega * sim->sim_time + src->phase);
-        
-        // Find grid cell range to iterate over (square around source)
-        int radius_cells = (int)ceil(src->radius / fmin(sim->dx, sim->dy)) + 1;
-        int src_ix = (int)round(src_x_full / sim->dx);
-        int src_iy = (int)round(src_y_full / sim->dy);
-        
-        int start_ix = fmax(0, src_ix - radius_cells);
-        int end_ix = fmin(sim->nx_total - 1, src_ix + radius_cells);
-        int start_iy = fmax(0, src_iy - radius_cells);
-        int end_iy = fmin(sim->ny_total - 1, src_iy + radius_cells);
-        
-        // Apply source within radius
-        for (int iy = start_iy; iy <= end_iy; iy++) {
-            for (int ix = start_ix; ix <= end_ix; ix++) {
-                // Check distance from source center
-                double x = ix * sim->dx;
-                double y = iy * sim->dy;
-                double dx = x - src_x_full;
-                double dy = y - src_y_full;
-                double dist = (dx * dx + dy * dy);
-
-                if (dist <= src->radius * src->radius) {
-                    // Within source radius - set to source value
-                    uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
-                    Literal *src_val = literal_create_scalar(source_value);
-                    grid_field_set(sim->u_source, idx, src_val);
-                    literal_free(src_val);
-                }
-            }
-        }
-    }
-    
-    // Mask source contributions onto u_curr and u_prev (overwrite values within source radii)
-    for (int src_idx = 0; src_idx < n_wave_sources; src_idx++) {
-        if (!wave_sources[src_idx].active) continue;
-        
-        WaveSource *src = &wave_sources[src_idx];
-        
-        double src_x_full = src->x + offset_x;
-        double src_y_full = src->y + offset_y;
+        double phase_val = sin(omega * sim->sim_time + src->phase);
+        double vx_source_val = src->amplitude * phase_val;
+        double vy_source_val = src->amplitude * cos(omega * sim->sim_time + src->phase);
         
         int radius_cells = (int)ceil(src->radius / fmin(sim->dx, sim->dy)) + 1;
         int src_ix = (int)round(src_x_full / sim->dx);
@@ -689,49 +489,269 @@ void simulation_step(SimulationState *sim) {
                 double y = iy * sim->dy;
                 double dx = x - src_x_full;
                 double dy = y - src_y_full;
-                double dist = (dx * dx + dy * dy);
+                double dist_sq = dx * dx + dy * dy;
 
-                if (dist <= src->radius*src->radius) {
+                if (dist_sq <= src->radius * src->radius) {
                     uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
                     
-                    // Get source value
-                    Literal *src_lit = grid_field_get(sim->u_source, idx);
-                    double src_val = src_lit ? src_lit->field[0] : 0.0;
-                    if (src_lit) literal_free(src_lit);
-                    
-                    // Set u_next to source value (drives the oscillation)
-                    // Don't touch u_curr or u_prev - let them evolve naturally
-                    Literal *set_lit = literal_create_scalar(src_val);
-                    grid_field_set(sim->u_curr, idx, set_lit);
-                    literal_free(set_lit);
+                    Literal *vx_lit = literal_create_scalar(vx_source_val);
+                    Literal *vy_lit = literal_create_scalar(vy_source_val);
+                    grid_field_set(sim->vx_curr, idx, vx_lit);
+                    grid_field_set(sim->vy_curr, idx, vy_lit);
+                    literal_free(vx_lit);
+                    literal_free(vy_lit);
                 }
             }
         }
     }
     
-
-    // Update variable dictionary with current field values
-    dict_set(sim->vars, "u_curr", &sim->u_curr->data);
-    dict_set(sim->vars, "u_prev", &sim->u_prev->data);
+    // ===========================================================================
+    // STEP 2: Advection + Diffusion
+    // v* = v^n + dt * [-(v·∇)v + ν∇²v]
+    // ===========================================================================
     
-    // Evaluate wave equation expression using grid-aware evaluation
-    Literal *result_lit = expression_evaluate_grid(sim->wave_expr, sim->vars, sim->grid);
-    if (!result_lit) return;
+    dict_set(sim->vars, "vx", &sim->vx_curr->data);
+    dict_set(sim->vars, "vy", &sim->vy_curr->data);
     
-    // Wrap result as GridField
-    GridField *result = grid_field_wrap_literal(result_lit, sim->grid);
+    // Evaluate diffusion term only (symbolic)
+    Literal *diffuse_vx_lit = expression_evaluate_grid(sim->diffuse_vx_expr, sim->vars, sim->grid);
+    Literal *diffuse_vy_lit = expression_evaluate_grid(sim->diffuse_vy_expr, sim->vars, sim->grid);
     
-    // Replace u_next with result
-    grid_field_free(sim->u_next);
-    sim->u_next = result;
+    if (!diffuse_vx_lit || !diffuse_vy_lit) {
+        printf("Error evaluating diffusion expressions\n");
+        if (diffuse_vx_lit) literal_free(diffuse_vx_lit);
+        if (diffuse_vy_lit) literal_free(diffuse_vy_lit);
+        return;
+    }
+    
+    // Compute intermediate velocity (advection computed numerically)
+    #pragma omp parallel for collapse(2)
+    for (uint32_t iy = 1; iy < sim->ny_total - 1; iy++) {
+        for (uint32_t ix = 1; ix < sim->nx_total - 1; ix++) {
+            uint32_t idx[3] = {ix, iy, 0};
+            uint32_t idx_xp[3] = {ix + 1, iy, 0};
+            uint32_t idx_xm[3] = {ix - 1, iy, 0};
+            uint32_t idx_yp[3] = {ix, iy + 1, 0};
+            uint32_t idx_ym[3] = {ix, iy - 1, 0};
+            int linear_idx = iy * sim->nx_total + ix;
+            
+            // Get current velocity
+            Literal *vx_lit = grid_field_get(sim->vx_curr, idx);
+            Literal *vy_lit = grid_field_get(sim->vy_curr, idx);
+            double vx = vx_lit ? vx_lit->field[0] : 0.0;
+            double vy = vy_lit ? vy_lit->field[0] : 0.0;
+            if (vx_lit) literal_free(vx_lit);
+            if (vy_lit) literal_free(vy_lit);
+            
+            // Get neighbor velocities for advection
+            Literal *vx_xp_lit = grid_field_get(sim->vx_curr, idx_xp);
+            Literal *vx_xm_lit = grid_field_get(sim->vx_curr, idx_xm);
+            Literal *vx_yp_lit = grid_field_get(sim->vx_curr, idx_yp);
+            Literal *vx_ym_lit = grid_field_get(sim->vx_curr, idx_ym);
+            double vx_xp = vx_xp_lit ? vx_xp_lit->field[0] : 0.0;
+            double vx_xm = vx_xm_lit ? vx_xm_lit->field[0] : 0.0;
+            double vx_yp = vx_yp_lit ? vx_yp_lit->field[0] : 0.0;
+            double vx_ym = vx_ym_lit ? vx_ym_lit->field[0] : 0.0;
+            if (vx_xp_lit) literal_free(vx_xp_lit);
+            if (vx_xm_lit) literal_free(vx_xm_lit);
+            if (vx_yp_lit) literal_free(vx_yp_lit);
+            if (vx_ym_lit) literal_free(vx_ym_lit);
+            
+            Literal *vy_xp_lit = grid_field_get(sim->vy_curr, idx_xp);
+            Literal *vy_xm_lit = grid_field_get(sim->vy_curr, idx_xm);
+            Literal *vy_yp_lit = grid_field_get(sim->vy_curr, idx_yp);
+            Literal *vy_ym_lit = grid_field_get(sim->vy_curr, idx_ym);
+            double vy_xp = vy_xp_lit ? vy_xp_lit->field[0] : 0.0;
+            double vy_xm = vy_xm_lit ? vy_xm_lit->field[0] : 0.0;
+            double vy_yp = vy_yp_lit ? vy_yp_lit->field[0] : 0.0;
+            double vy_ym = vy_ym_lit ? vy_ym_lit->field[0] : 0.0;
+            if (vy_xp_lit) literal_free(vy_xp_lit);
+            if (vy_xm_lit) literal_free(vy_xm_lit);
+            if (vy_yp_lit) literal_free(vy_yp_lit);
+            if (vy_ym_lit) literal_free(vy_ym_lit);
+            
+            // Compute advection: -(vx*∂vx/∂x + vy*∂vx/∂y) and -(vx*∂vy/∂x + vy*∂vy/∂y)
+            double dvx_dx = (vx_xp - vx_xm) / (2.0 * sim->dx);
+            double dvx_dy = (vx_yp - vx_ym) / (2.0 * sim->dy);
+            double dvy_dx = (vy_xp - vy_xm) / (2.0 * sim->dx);
+            double dvy_dy = (vy_yp - vy_ym) / (2.0 * sim->dy);
+            
+            double advect_vx = -(vx * dvx_dx + vy * dvx_dy);
+            double advect_vy = -(vx * dvy_dx + vy * dvy_dy);
+            
+            // Get diffusion terms
+            double diffuse_vx = diffuse_vx_lit->field[linear_idx];
+            double diffuse_vy = diffuse_vy_lit->field[linear_idx];
+            
+            // Predictor step
+            double vx_star = vx + sim->dt * (advect_vx + diffuse_vx);
+            double vy_star = vy + sim->dt * (advect_vy + diffuse_vy);
+            
+            Literal *vx_star_lit = literal_create_scalar(vx_star);
+            Literal *vy_star_lit = literal_create_scalar(vy_star);
+            grid_field_set(sim->vx_next, idx, vx_star_lit);
+            grid_field_set(sim->vy_next, idx, vy_star_lit);
+            literal_free(vx_star_lit);
+            literal_free(vy_star_lit);
+        }
+    }
+    
+    literal_free(diffuse_vx_lit);
+    literal_free(diffuse_vy_lit);
+    
+    // ===========================================================================
+    // STEP 3: Compute Divergence
+    // div = ∂vx/∂x + ∂vy/∂y
+    // ===========================================================================
+    
+    // Compute divergence numerically using centered differences
+    #pragma omp parallel for collapse(2)
+    for (uint32_t iy = 1; iy < sim->ny_total - 1; iy++) {
+        for (uint32_t ix = 1; ix < sim->nx_total - 1; ix++) {
+            uint32_t idx[3] = {ix, iy, 0};
+            uint32_t idx_xp[3] = {ix + 1, iy, 0};
+            uint32_t idx_xm[3] = {ix - 1, iy, 0};
+            uint32_t idx_yp[3] = {ix, iy + 1, 0};
+            uint32_t idx_ym[3] = {ix, iy - 1, 0};
+            
+            Literal *vx_xp_lit = grid_field_get(sim->vx_next, idx_xp);
+            Literal *vx_xm_lit = grid_field_get(sim->vx_next, idx_xm);
+            Literal *vy_yp_lit = grid_field_get(sim->vy_next, idx_yp);
+            Literal *vy_ym_lit = grid_field_get(sim->vy_next, idx_ym);
+            
+            double vx_xp = vx_xp_lit ? vx_xp_lit->field[0] : 0.0;
+            double vx_xm = vx_xm_lit ? vx_xm_lit->field[0] : 0.0;
+            double vy_yp = vy_yp_lit ? vy_yp_lit->field[0] : 0.0;
+            double vy_ym = vy_ym_lit ? vy_ym_lit->field[0] : 0.0;
+            
+            if (vx_xp_lit) literal_free(vx_xp_lit);
+            if (vx_xm_lit) literal_free(vx_xm_lit);
+            if (vy_yp_lit) literal_free(vy_yp_lit);
+            if (vy_ym_lit) literal_free(vy_ym_lit);
+            
+            double div = (vx_xp - vx_xm) / (2.0 * sim->dx) + (vy_yp - vy_ym) / (2.0 * sim->dy);
+            
+            Literal *div_lit = literal_create_scalar(div);
+            grid_field_set(sim->divergence, idx, div_lit);
+            literal_free(div_lit);
+        }
+    }
+    
+    // ===========================================================================
+    // STEP 4: Solve Pressure Poisson Equation
+    // ∇²p = ρ/dt * div
+    // ===========================================================================
+    
+    // Create PDE system once on first call
+    if (!sim->pressure_system) {
+        sim->pressure_system = pde_system_create();
         
-    // Apply sponge layer damping
+        Expression *p_var = expr_variable("p");
+        Expression *lap_p = expr_laplacian(p_var);
+        Expression *div_var = expr_variable("div");
+        
+        double coeff = sim->density / sim->dt;
+        Expression *coeff_lit = expr_literal(literal_create_scalar(coeff));
+        Expression *rhs = expr_multiply(coeff_lit, div_var);
+        Expression *neg_rhs = expr_negate(rhs);
+        Expression *pressure_eq = expr_add(lap_p, neg_rhs);
+        
+        pde_system_add_equation(sim->pressure_system, pressure_eq);
+        
+        char *unknowns[] = {"p"};
+        pde_system_set_unknowns(sim->pressure_system, unknowns, 1);
+        pde_system_set_grid(sim->pressure_system, sim->grid);
+        pde_system_set_tolerance(sim->pressure_system, 1e-4);
+        pde_system_set_max_iterations(sim->pressure_system, 100);
+    }
+    
+    // Update divergence parameter for this step
+    // The solver will use this when evaluating the RHS of the pressure equation
+    dict_set(sim->pressure_system->parameters, "div", &sim->divergence->data);
+    
+    // Initialize pressure in dictionary for solver
+    dict_set(sim->vars, "p", &sim->pressure->data);
+    
+    SolverResult *result = solve_newton_krylov(sim->pressure_system, sim->vars);
+    
+    if (!result) {
+        printf("Error: Pressure solve returned NULL\n");
+        return;
+    }
+    
+    SolverStatus status = result->status;
+    
+    if (status != SOLVER_SUCCESS && status != SOLVER_MAX_ITER) {
+        printf("Warning: Pressure solve failed with status %d\n", status);
+    }
+    
+    Literal *pressure_lit = NULL;
+    dict_get(sim->vars, "p", &pressure_lit);
+    if (pressure_lit) {
+        GridField *new_pressure = grid_field_wrap_literal(literal_copy(pressure_lit), sim->grid);
+        grid_field_free(sim->pressure);
+        sim->pressure = new_pressure;
+    }
+    
+    solver_result_free(result);
+    
+    // ===========================================================================
+    // STEP 5: Project to Divergence-Free
+    // v^(n+1) = v* - (dt/ρ) * ∇p
+    // ===========================================================================
+    
+    double dt_over_rho = sim->dt / sim->density;
+    
+    #pragma omp parallel for collapse(2)
+    for (uint32_t iy = 1; iy < sim->ny_total - 1; iy++) {
+        for (uint32_t ix = 1; ix < sim->nx_total - 1; ix++) {
+            uint32_t idx[3] = {ix, iy, 0};
+            uint32_t idx_xp[3] = {ix + 1, iy, 0};
+            uint32_t idx_xm[3] = {ix - 1, iy, 0};
+            uint32_t idx_yp[3] = {ix, iy + 1, 0};
+            uint32_t idx_ym[3] = {ix, iy - 1, 0};
+            
+            Literal *vx_star_lit = grid_field_get(sim->vx_next, idx);
+            Literal *vy_star_lit = grid_field_get(sim->vy_next, idx);
+            double vx_star = vx_star_lit ? vx_star_lit->field[0] : 0.0;
+            double vy_star = vy_star_lit ? vy_star_lit->field[0] : 0.0;
+            if (vx_star_lit) literal_free(vx_star_lit);
+            if (vy_star_lit) literal_free(vy_star_lit);
+            
+            Literal *p_xp = grid_field_get(sim->pressure, idx_xp);
+            Literal *p_xm = grid_field_get(sim->pressure, idx_xm);
+            Literal *p_yp = grid_field_get(sim->pressure, idx_yp);
+            Literal *p_ym = grid_field_get(sim->pressure, idx_ym);
+            
+            double dp_dx = (p_xp->field[0] - p_xm->field[0]) / (2.0 * sim->dx);
+            double dp_dy = (p_yp->field[0] - p_ym->field[0]) / (2.0 * sim->dy);
+            
+            literal_free(p_xp);
+            literal_free(p_xm);
+            literal_free(p_yp);
+            literal_free(p_ym);
+            
+            double vx_new = vx_star - dt_over_rho * dp_dx;
+            double vy_new = vy_star - dt_over_rho * dp_dy;
+            
+            Literal *vx_new_lit = literal_create_scalar(vx_new);
+            Literal *vy_new_lit = literal_create_scalar(vy_new);
+            grid_field_set(sim->vx_curr, idx, vx_new_lit);
+            grid_field_set(sim->vy_curr, idx, vy_new_lit);
+            literal_free(vx_new_lit);
+            literal_free(vy_new_lit);
+        }
+    }
+    
+    // ===========================================================================
+    // STEP 6: Apply Sponge Layer Damping
+    // ===========================================================================
+    
     #pragma omp parallel for collapse(2)
     for (uint32_t iy = 0; iy < sim->ny_total; iy++) {
         for (uint32_t ix = 0; ix < sim->nx_total; ix++) {
             uint32_t idx[3] = {ix, iy, 0};
             
-            // Distance from sponge boundary
             int dist_x_min = ix;
             int dist_x_max = sim->nx_total - 1 - ix;
             int dist_y_min = iy;
@@ -742,53 +762,35 @@ void simulation_step(SimulationState *sim) {
             if (dist_y_max < min_dist) min_dist = dist_y_max;
             
             if (min_dist < sim->sponge_width) {
-                // Quadratic ramp: σ = σ_max * (1 - d/w)²
                 double d_normalized = (double)min_dist / (double)sim->sponge_width;
-                double sigma = SIGMA_MAX * (1.0 - d_normalized) * (1.0 - d_normalized);
+                double damping = (1.0 - d_normalized) * (1.0 - d_normalized);
                 
-                // Get current and previous values
-                Literal *lit_c = grid_field_get(sim->u_curr, idx);
-                Literal *lit_p = grid_field_get(sim->u_prev, idx);
-                Literal *lit_n_old = grid_field_get(sim->u_next, idx);
+                Literal *vx_lit = grid_field_get(sim->vx_curr, idx);
+                Literal *vy_lit = grid_field_get(sim->vy_curr, idx);
+                double vx = vx_lit ? vx_lit->field[0] : 0.0;
+                double vy = vy_lit ? vy_lit->field[0] : 0.0;
+                if (vx_lit) literal_free(vx_lit);
+                if (vy_lit) literal_free(vy_lit);
                 
-                double u_curr_val = lit_c ? lit_c->field[0] : 0.0;
-                double u_prev_val = lit_p ? lit_p->field[0] : 0.0;
-                double u_next_old = lit_n_old ? lit_n_old->field[0] : 0.0;
+                double decay = exp(-damping * SIGMA_MAX * sim->dt);
+                vx *= decay;
+                vy *= decay;
                 
-                // Free the Literals returned by grid_field_get
-                if (lit_c) literal_free(lit_c);
-                if (lit_p) literal_free(lit_p);
-                if (lit_n_old) literal_free(lit_n_old);
-                
-                // Compute acceleration from wave equation
-                double accel = u_next_old - 2.0 * u_curr_val + u_prev_val;
-                
-                // Sponge layer formula: includes damping on velocity
-                // u_next = (2 - σdt)*u_curr - (1 - σdt)*u_prev + accel
-                double u_next_val = (2.0 - sigma * sim->dt) * u_curr_val 
-                                  - (1.0 - sigma * sim->dt) * u_prev_val 
-                                  + accel;
-                
-                Literal *new_val = literal_create_scalar(u_next_val);
-                grid_field_set(sim->u_next, idx, new_val);
-                literal_free(new_val);
+                Literal *vx_damped = literal_create_scalar(vx);
+                Literal *vy_damped = literal_create_scalar(vy);
+                grid_field_set(sim->vx_curr, idx, vx_damped);
+                grid_field_set(sim->vy_curr, idx, vy_damped);
+                literal_free(vx_damped);
+                literal_free(vy_damped);
             }
         }
     }
-    
-    
-    // Cycle fields
-    GridField *tmp = sim->u_prev;
-    sim->u_prev = sim->u_curr;
-    sim->u_curr = sim->u_next;
-    sim->u_next = tmp;
     
     sim->sim_time += sim->dt;
     sim->step_count++;
     sim->steps_since_last_update++;
     
-    // Calculate current energy and error
-    sim->total_energy = calculate_total_energy(sim);
+    sim->total_energy = calculate_kinetic_energy(sim);
     if (sim->baseline_energy > 0.0) {
         sim->energy_error = (sim->total_energy - sim->baseline_energy) / sim->baseline_energy;
     } else {
@@ -801,13 +803,13 @@ void simulation_step(SimulationState *sim) {
 // =============================================================================
 
 // Map value to RGB color based on render mode
-void value_to_color(double height, double vx, double vy, 
+void value_to_color(double pressure, double vx, double vy, 
                    RenderMode mode, double scale,
                    uint8_t *r, uint8_t *g, uint8_t *b) {
     switch (mode) {
-        case RENDER_HEIGHT: {
-            // Red for positive, blue for negative
-            double val = height * scale;
+        case RENDER_PRESSURE: {
+            // Red for high pressure, blue for low pressure
+            double val = pressure * scale;
             if (val > 0) {
                 *r = (uint8_t)fmin(255, val * 255);
                 *g = 0;
@@ -825,10 +827,19 @@ void value_to_color(double height, double vx, double vy,
             *r = *g = *b = gray;
             break;
         }
+        case RENDER_VORTICITY: {
+            // Vorticity visualization (will be computed in render function)
+            // For now, just use a placeholder
+            double val = pressure * scale;  // placeholder
+            *r = (uint8_t)fmin(255, fmax(0, 127.5 + val * 127.5));
+            *g = (uint8_t)fmin(255, fmax(0, 127.5 - val * 127.5));
+            *b = 128;
+            break;
+        }
         case RENDER_RGB: {
             *r = (uint8_t)fmin(255, fmax(0, 127.5 + vx * scale * 127.5));
             *g = (uint8_t)fmin(255, fmax(0, 127.5 + vy * scale * 127.5));
-            *b = (uint8_t)fmin(255, fmax(0, 127.5 + height * scale * 127.5));
+            *b = (uint8_t)fmin(255, fmax(0, 127.5 + pressure * scale * 127.5));
             break;
         }
     }
@@ -855,43 +866,21 @@ void render_wave_field(SimulationState *sim, RenderState *render,
             idx[0] = ix;
             idx[1] = iy;
             
-            Literal *lit_height = grid_field_get(sim->u_curr, idx);
-            double height = lit_height ? lit_height->field[0] : 0.0;
-            if (lit_height) literal_free(lit_height);
+            // Get velocity components
+            Literal *lit_vx = grid_field_get(sim->vx_curr, idx);
+            Literal *lit_vy = grid_field_get(sim->vy_curr, idx);
+            double vx = lit_vx ? lit_vx->field[0] : 0.0;
+            double vy = lit_vy ? lit_vy->field[0] : 0.0;
+            if (lit_vx) literal_free(lit_vx);
+            if (lit_vy) literal_free(lit_vy);
             
-            // Calculate spatial velocity using centered finite differences
-            // vx = ∂u/∂x ≈ (u[i+1,j] - u[i-1,j]) / (2*dx)
-            // vy = ∂u/∂y ≈ (u[i,j+1] - u[i,j-1]) / (2*dy)
-            double vx = 0.0, vy = 0.0;
-            
-            // Compute x-derivative (if not on x-boundary)
-            if (ix > 0 && ix < sim->nx_total - 1) {
-                uint32_t idx_left[3] = {ix - 1, iy, 0};
-                uint32_t idx_right[3] = {ix + 1, iy, 0};
-                Literal *lit_left = grid_field_get(sim->u_curr, idx_left);
-                Literal *lit_right = grid_field_get(sim->u_curr, idx_right);
-                double u_left = lit_left ? lit_left->field[0] : 0.0;
-                double u_right = lit_right ? lit_right->field[0] : 0.0;
-                vx = (u_right - u_left) / (2.0 * sim->dx);
-                if (lit_left) literal_free(lit_left);
-                if (lit_right) literal_free(lit_right);
-            }
-            
-            // Compute y-derivative (if not on y-boundary)
-            if (iy > 0 && iy < sim->ny_total - 1) {
-                uint32_t idx_down[3] = {ix, iy - 1, 0};
-                uint32_t idx_up[3] = {ix, iy + 1, 0};
-                Literal *lit_down = grid_field_get(sim->u_curr, idx_down);
-                Literal *lit_up = grid_field_get(sim->u_curr, idx_up);
-                double u_down = lit_down ? lit_down->field[0] : 0.0;
-                double u_up = lit_up ? lit_up->field[0] : 0.0;
-                vy = (u_up - u_down) / (2.0 * sim->dy);
-                if (lit_down) literal_free(lit_down);
-                if (lit_up) literal_free(lit_up);
-            }
+            // Get pressure
+            Literal *lit_pressure = grid_field_get(sim->pressure, idx);
+            double pressure = lit_pressure ? lit_pressure->field[0] : 0.0;
+            if (lit_pressure) literal_free(lit_pressure);
             
             uint8_t r = 0, g = 0, b = 0;
-            value_to_color(height, vx, vy, render->mode, render->value_scale, &r, &g, &b);
+            value_to_color(pressure, vx, vy, render->mode, render->value_scale, &r, &g, &b);
             
             // Grid coordinates (visible region)
             int gx = ix - start_x;
@@ -1097,60 +1086,81 @@ int find_boundary_using_point(SimulationState *sim, int point_idx) {
     return -1;
 }
 
-// Add Gaussian wave centered at physical coordinates
+// Add Gaussian velocity impulse at physical coordinates
+// Add Gaussian velocity impulse at physical coordinates
 void add_wave_at_position(SimulationState *sim, double phys_x, double phys_y) {
     double offset_x = sim->sponge_width * sim->dx;
     double offset_y = sim->sponge_width * sim->dy;
-
     
+    // Convert physical coordinates (in visible region) to full grid coordinates
+    double full_grid_x = phys_x + offset_x;
+    double full_grid_y = phys_y + offset_y;
     
-    // Update baseline energy with self-energy + interaction energy
-    double E_self = estimate_wave_energy(sim, sim->wave_amplitude, sim->wave_spread);
-    double E_interaction = calculate_interaction_energy(sim, phys_x, phys_y, 
-                                                        sim->wave_amplitude, sim->wave_spread);
+    // Find center cell in full grid
+    int center_ix = (int)round(full_grid_x / sim->dx);
+    int center_iy = (int)round(full_grid_y / sim->dy);
     
-    for (uint32_t iy = 0; iy < sim->ny_total; iy++) {
-        for (uint32_t ix = 0; ix < sim->nx_total; ix++) {
-            uint32_t idx[3] = {ix, iy, 0};
+    // For testing, add a strong upward impulse
+    double vx_impulse = 0.0;
+    double vy_impulse = sim->velocity_impulse_strength;
+    
+    // Only iterate over cells within 2*radius of click point (optimization)
+    int radius_cells = (int)ceil(2.0 * sim->velocity_impulse_radius / fmin(sim->dx, sim->dy)) + 1;
+    int start_ix = fmax(0, center_ix - radius_cells);
+    int end_ix = fmin((int)sim->nx_total - 1, center_ix + radius_cells);
+    int start_iy = fmax(0, center_iy - radius_cells);
+    int end_iy = fmin((int)sim->ny_total - 1, center_iy + radius_cells);
+    
+    int cells_modified = 0;
+    
+    for (int iy = start_iy; iy <= end_iy; iy++) {
+        for (int ix = start_ix; ix <= end_ix; ix++) {
+            uint32_t idx[3] = {(uint32_t)ix, (uint32_t)iy, 0};
             
             // Get physical coordinates of this grid point
             double x = ix * sim->dx;
             double y = iy * sim->dy;
             
-            // Distance from click point
-            double dx = x - (phys_x + offset_x);
-            double dy = y - (phys_y + offset_y);
+            // Distance from click point (in full grid coordinates)
+            double dx = x - full_grid_x;
+            double dy = y - full_grid_y;
             double r2 = dx * dx + dy * dy;
             
-            // Gaussian wave
-            double wave_val = sim->wave_amplitude * exp(-r2 / (2.0 * sim->wave_spread * sim->wave_spread));
-            
-            // Add to current field
-            Literal *lit_curr = grid_field_get(sim->u_curr, idx);
-            double curr_val = lit_curr ? lit_curr->field[0] : 0.0;
-            if (lit_curr) literal_free(lit_curr);
-
-            // Add to prev field
-            Literal *lit_prev = grid_field_get(sim->u_prev, idx);
-            double prev_val = lit_prev ? lit_prev->field[0] : 0.0;
-            if (lit_prev) literal_free(lit_prev);
-            
-            Literal *new_val_curr = literal_create_scalar(curr_val + wave_val);
-            grid_field_set(sim->u_curr, idx, new_val_curr);
-            Literal *new_val_prev = literal_create_scalar(prev_val + wave_val);
-            // grid_field_set(sim->u_prev, idx, new_val_prev);
-            literal_free(new_val_curr);
-            literal_free(new_val_prev);
+            // Gaussian falloff
+            double radius_sq = sim->velocity_impulse_radius * sim->velocity_impulse_radius;
+            if (r2 < radius_sq * 4.0) {  // Only apply within 2*radius
+                double gaussian = exp(-r2 / (2.0 * radius_sq));
+                
+                // Add velocity impulse
+                Literal *lit_vx = grid_field_get(sim->vx_curr, idx);
+                Literal *lit_vy = grid_field_get(sim->vy_curr, idx);
+                double curr_vx = lit_vx ? lit_vx->field[0] : 0.0;
+                double curr_vy = lit_vy ? lit_vy->field[0] : 0.0;
+                if (lit_vx) literal_free(lit_vx);
+                if (lit_vy) literal_free(lit_vy);
+                
+                double new_vx = curr_vx + vx_impulse * gaussian;
+                double new_vy = curr_vy + vy_impulse * gaussian;
+                
+                Literal *new_vx_lit = literal_create_scalar(new_vx);
+                Literal *new_vy_lit = literal_create_scalar(new_vy);
+                grid_field_set(sim->vx_curr, idx, new_vx_lit);
+                grid_field_set(sim->vy_curr, idx, new_vy_lit);
+                literal_free(new_vx_lit);
+                literal_free(new_vy_lit);
+                
+                cells_modified++;
+            }
         }
     }
-    double wave_energy = E_self + E_interaction;
-    sim->baseline_energy += wave_energy;
     
-    printf("Added wave at (%.3f, %.3f) with amplitude %.2f, spread %.3f\n", 
-           phys_x, phys_y, sim->wave_amplitude, sim->wave_spread);
-    printf("  Self-energy: %.6f | Interaction: %.6f | Total added: %.6f\n",
-           E_self, E_interaction, wave_energy);
-    printf("  New baseline: %.6f\n", sim->baseline_energy);
+    printf("Added velocity impulse at visible (%.3f, %.3f) -> grid (%d, %d), modified %d cells\n", 
+           phys_x, phys_y, center_ix, center_iy, cells_modified);
+}
+
+// Backwards-compatible wrapper: new name used in some places
+void add_velocity_impulse(SimulationState *sim, double phys_x, double phys_y) {
+    add_wave_at_position(sim, phys_x, phys_y);
 }
 
 // Add barrier segment between two points
@@ -1202,7 +1212,7 @@ void add_barrier_segment(SimulationState *sim, double x1, double y1, double x2, 
 // =============================================================================
 // Menu System 
 // =============================================================================
-// NOTE: Menu system included from separate file
+// Menu system included from separate file
 // It contains: Menus struct, all callback functions, initialize_menus(), free_menus()
 #include "interactive_wave_sim_menu.inc"
 
@@ -1241,13 +1251,14 @@ int main(int argc, char **argv) {
     
     // Create render state
     RenderState render;
-    render.mode = RENDER_HEIGHT;
-    render.value_scale = 1.0;
+    render.mode = RENDER_VELOCITY;  // Start with velocity visualization
+    render.value_scale = 10.0;      // Scale for better visibility
     render.show_boundaries = 1;
     render.show_stats = 1;
-    // Initialize radio button states (HEIGHT is default)
-    render.mode_height = 1;
-    render.mode_velocity = 0;
+    // Initialize radio button states (VELOCITY is default)
+    render.mode_pressure = 0;
+    render.mode_velocity = 1;
+    render.mode_vorticity = 0;
     render.mode_rgb = 0;
     g_render = &render;
     
@@ -1349,7 +1360,7 @@ int main(int argc, char **argv) {
                 
                 // Update radio button states
                 g_mouse_none = (g_mouse_mode == MOUSE_NONE) ? 1 : 0;
-                g_mouse_add_wave = (g_mouse_mode == MOUSE_ADD_WAVE) ? 1 : 0;
+                g_mouse_add_velocity = (g_mouse_mode == MOUSE_ADD_VELOCITY) ? 1 : 0;
                 g_mouse_add_barrier = (g_mouse_mode == MOUSE_ADD_BARRIER) ? 1 : 0;
                 g_mouse_source = (g_mouse_mode == MOUSE_SOURCE) ? 1 : 0;
                 
@@ -1435,12 +1446,12 @@ int main(int argc, char **argv) {
                         double phys_x = ((double)mx / window_width) * sim->Lx_visible;
                         double phys_y = (1.0 - (double)my / window_height) * sim->Ly_visible;
                         
-                        if (g_mouse_mode == MOUSE_ADD_WAVE) {
-                            add_wave_at_position(sim, phys_x, phys_y);
-                            // Start wave painting mode
-                            wave_painting = 1;
-                            last_wave_x = phys_x;
-                            last_wave_y = phys_y;
+                        if (g_mouse_mode == MOUSE_ADD_VELOCITY) {
+                            add_velocity_impulse(sim, phys_x, phys_y);
+                            // Start velocity painting mode
+                            velocity_painting = 1;
+                            last_velocity_x = phys_x;
+                            last_velocity_y = phys_y;
                         } else if (g_mouse_mode == MOUSE_ADD_BARRIER) {
                             // Snap to cell center
                             snap_to_cell_center(sim, &phys_x, &phys_y);
@@ -1512,9 +1523,9 @@ int main(int argc, char **argv) {
                                     wave_sources[n_wave_sources].x = phys_x;
                                     wave_sources[n_wave_sources].y = phys_y;
                                     wave_sources[n_wave_sources].frequency = g_default_source_frequency;
-                                    wave_sources[n_wave_sources].phase = g_default_source_phase;  // From mouse controls
-                                    wave_sources[n_wave_sources].amplitude = sim->wave_amplitude;  // From mouse controls
-                                    wave_sources[n_wave_sources].radius = sim->wave_spread;        // From mouse controls
+                                    wave_sources[n_wave_sources].phase = g_default_source_phase;
+                                    wave_sources[n_wave_sources].amplitude = sim->velocity_impulse_strength;
+                                    wave_sources[n_wave_sources].radius = sim->velocity_impulse_radius;
                                     wave_sources[n_wave_sources].active = 1;
                                     
                                     // Select this new source
@@ -1535,11 +1546,11 @@ int main(int argc, char **argv) {
                     // End any active slider drag
                     menu_end_slider_drag();
                     
-                    // End wave painting mode
-                    if (wave_painting) {
-                        wave_painting = 0;
-                        last_wave_x = -1.0;
-                        last_wave_y = -1.0;
+                    // End velocity painting mode
+                    if (velocity_painting) {
+                        velocity_painting = 0;
+                        last_velocity_x = -1.0;
+                        last_velocity_y = -1.0;
                     }
                     
                     // Handle barrier point deletion/dragging end
@@ -1647,22 +1658,22 @@ int main(int argc, char **argv) {
                         menu_handle_mouse_motion(menus->source_menu, mx, my);
                     }
                     
-                    // Wave painting (if in ADD_WAVE mode and mouse button held)
-                    if (g_mouse_mode == MOUSE_ADD_WAVE && wave_painting && 
+                    // Velocity painting (if in ADD_VELOCITY mode and mouse button held)
+                    if (g_mouse_mode == MOUSE_ADD_VELOCITY && velocity_painting && 
                         (event.motion.state & SDL_BUTTON_LMASK)) {
                         // Convert to physical coordinates
                         double phys_x = ((double)mx / window_width) * sim->Lx_visible;
                         double phys_y = (1.0 - (double)my / window_height) * sim->Ly_visible;
                         
-                        // Only add wave if we've moved far enough from last position
-                        double dx = phys_x - last_wave_x;
-                        double dy = phys_y - last_wave_y;
+                        // Only add velocity if we've moved far enough from last position
+                        double dx = phys_x - last_velocity_x;
+                        double dy = phys_y - last_velocity_y;
                         double dist = sqrt(dx * dx + dy * dy);
                         
-                        if (dist >= wave_paint_spacing) {
-                            add_wave_at_position(sim, phys_x, phys_y);
-                            last_wave_x = phys_x;
-                            last_wave_y = phys_y;
+                        if (dist >= velocity_paint_spacing) {
+                            add_velocity_impulse(sim, phys_x, phys_y);
+                            last_velocity_x = phys_x;
+                            last_velocity_y = phys_y;
                         }
                     }
                     
@@ -1874,8 +1885,8 @@ int main(int argc, char **argv) {
                     float preview_sx = (preview_phys_x / sim->Lx_visible) * window_width;
                     float preview_sy = (1.0 - preview_phys_y / sim->Ly_visible) * window_height;
                     
-                    // Draw preview circle with radius based on current spread setting
-                    float radius_screen = sim->wave_spread * ((window_width / sim->Lx_visible) + 
+                    // Draw preview circle with radius based on current velocity impulse radius setting
+                    float radius_screen = sim->velocity_impulse_radius * ((window_width / sim->Lx_visible) + 
                                                                (window_height / sim->Ly_visible)) / 2.0;
                     
                     // Draw filled circle
