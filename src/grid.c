@@ -1,5 +1,6 @@
 #include "../include/grid.h"
 #include <stdlib.h>
+#include <assert.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -23,6 +24,9 @@ GridMetadata* grid_metadata_create(const uint32_t *dims,
     grid->n_interior_boundaries = 0;
     grid->refcount = 1; // Initialize reference counter
 
+    // Allocate and initialize strides array for fast indexing
+    grid->strides = malloc(sizeof(uint32_t) * n_dims);
+
     grid->total_points = 1;
     for (int i = 0; i < n_dims; i++) {
         grid->dims[i] = dims[i];
@@ -42,6 +46,13 @@ GridMetadata* grid_metadata_create(const uint32_t *dims,
         grid->boundaries[i*2+1].extrapolation_order = 5;  // Default to cubic
     }
 
+    // Pre-compute strides: strides[i] = dims[i+1] * dims[i+2] * ... * dims[n-1]
+    // For row-major order: linear = sum(indices[i] * strides[i])
+    grid->strides[n_dims - 1] = 1;
+    for (int i = n_dims - 2; i >= 0; i--) {
+        grid->strides[i] = grid->strides[i + 1] * dims[i + 1];
+    }
+
     return grid;
 }
 
@@ -55,6 +66,7 @@ void grid_metadata_free(GridMetadata *grid) {
     free(grid->origin);
     free(grid->extent);
     free(grid->boundaries);
+    free(grid->strides);  // Free pre-computed strides
     
     // Free interior hyperplane boundaries
     if (grid->interior_boundaries) {
@@ -62,8 +74,10 @@ void grid_metadata_free(GridMetadata *grid) {
             free(grid->interior_boundaries[i].normal);
             free(grid->interior_boundaries[i].point);
             free(grid->interior_boundaries[i].bounds_min);
-            free(grid->interior_boundaries[i].bounds_max);            free(grid->interior_boundaries[i].bbox_min);
-            free(grid->interior_boundaries[i].bbox_max);        }
+            free(grid->interior_boundaries[i].bounds_max);
+            free(grid->interior_boundaries[i].bbox_min);
+            free(grid->interior_boundaries[i].bbox_max);
+        }
         free(grid->interior_boundaries);
     }
     
@@ -92,7 +106,12 @@ uint32_t grid_index_to_linear(const GridMetadata *grid, const uint32_t *indices)
     return linear;
 }
 
-void grid_linear_to_index(const GridMetadata *grid, uint32_t linear, uint32_t *indices) {
+void grid_linear_to_index(const GridMetadata *grid, uint32_t linear, uint32_t *indices) {   
+    if (!grid || !indices) return;
+    // Zero all N_DIM entries to ensure callers that expect full
+    // N_DIM-indexed tensors see well-defined zeroes in higher dims.
+    for (int k = 0; k < N_DIM; k++) indices[k] = 0;
+
     for (int i = grid->n_dims - 1; i >= 0; i--) {
         indices[i] = linear % grid->dims[i];
         linear /= grid->dims[i];
@@ -300,6 +319,14 @@ GridField* grid_field_create(GridMetadata *grid) {
         field->data.field = NULL;
     }
     
+    if (getenv("GRID_DEBUG")) {
+        fprintf(stderr, "[grid] grid_field_create: grid=%p n_dims=%d total_elems=%zu grid_total=%u shape=[",
+                (void*)grid, grid->n_dims, total, grid->total_points);
+        for (int i = 0; i < N_DIM; i++) {
+            fprintf(stderr, "%u%s", field->data.shape[i], (i == N_DIM - 1) ? "]" : ", ");
+        }
+        fprintf(stderr, "\n");
+    }
     return field;
 }
 
@@ -372,7 +399,8 @@ Literal grid_field_evaluate(const GridField *field, const double *coords) {
         memset(&empty, 0, sizeof(Literal));
         return empty;
     }
-    uint32_t indices[field->grid->n_dims];
+    uint32_t indices[N_DIM];
+    for (int i = 0; i < N_DIM; i++) indices[i] = 0;
     if (!grid_coord_to_index(field->grid, coords, indices)) {
         Literal empty;
         memset(&empty, 0, sizeof(Literal));
@@ -390,7 +418,8 @@ Literal grid_field_evaluate(const GridField *field, const double *coords) {
 }
 
 void grid_field_fill(GridField *field, const Literal *value) {
-    uint32_t indices[field->grid->n_dims];
+    uint32_t indices[N_DIM];
+    for (int i = 0; i < N_DIM; i++) indices[i] = 0;
     if (!field || !value) return;
     for (uint32_t i = 0; i < field->grid->total_points; i++) {
         grid_linear_to_index(field->grid, i, indices);
@@ -402,8 +431,8 @@ void grid_field_init_from_function(GridField *field, Literal* (*func)(const doub
     if (!field || !func) return;
     GridMetadata *grid = field->grid;
     int n_dims = grid->n_dims;
-    uint32_t *indices = malloc(sizeof(uint32_t) * n_dims);
-    double *coords = malloc(sizeof(double) * n_dims);
+    uint32_t indices[N_DIM];
+    double coords[N_DIM];
     for (uint32_t linear = 0; linear < grid->total_points; linear++) {
         grid_linear_to_index(grid, linear, indices);
         grid_index_to_coord(grid, indices, coords);
@@ -413,13 +442,350 @@ void grid_field_init_from_function(GridField *field, Literal* (*func)(const doub
             literal_free(value_ptr);
         }
     }
-    free(indices);
-    free(coords);
+    (void)0; // indices/coords are stack-allocated
 }
 
 // ============================================================================
 // Finite Difference Operators
 // ============================================================================
+
+// Thomas algorithm solver for tridiagonal systems
+// Solves Ax = d where A is tridiagonal with diagonals (a, b, c)
+// a[i] = subdiagonal, b[i] = diagonal, c[i] = superdiagonal
+// d[i] = RHS; result stored in x
+// Complexity: O(8n) operations vs O(n³) for general solver
+static void thomas_solve(const double *a, const double *b, const double *c,
+                         const double *d, double *x, int n) {
+    if (n <= 0) return;
+    
+    double *c_prime = malloc(n * sizeof(double));
+    double *d_prime = malloc(n * sizeof(double));
+    
+    // Forward elimination
+    c_prime[0] = c[0] / b[0];
+    d_prime[0] = d[0] / b[0];
+    
+    for (int i = 1; i < n; i++) {
+        double denom = b[i] - a[i] * c_prime[i-1];
+        c_prime[i] = (i < n-1) ? c[i] / denom : 0.0;
+        d_prime[i] = (d[i] - a[i] * d_prime[i-1]) / denom;
+    }
+    
+    // Back substitution
+    x[n-1] = d_prime[n-1];
+    for (int i = n-2; i >= 0; i--) {
+        x[i] = d_prime[i] - c_prime[i] * x[i+1];
+    }
+    
+    free(c_prime);
+    free(d_prime);
+}
+
+// Compact (Padé) finite difference method for derivatives
+// Uses 4th-order implicit scheme with tridiagonal solve
+// Reduces index conversions from O(N²) to O(N) by processing 1D slices
+GridField* grid_field_derivative_compact(const GridField *field, int axis, int order) {
+    if (!field || axis < 0 || axis >= field->grid->n_dims) return NULL;
+    if (order < 1 || order > 2) return NULL;
+    
+    GridMetadata *grid = field->grid;
+    GridField *result = grid_field_create(grid);
+    if (!result) return NULL;
+    
+    double h = grid->spacing[axis];
+    uint32_t n = grid->dims[axis];
+    
+    // Fall back to explicit for very small dimensions
+    if (n < 5) {
+        grid_field_free(result);
+        return grid_field_derivative(field, axis, order);
+    }
+    
+    // Ensure result field is allocated
+    if (!result->data.field) {
+        size_t total = literal_total_elements(&result->data);
+        result->data.field = (double*)calloc(total, sizeof(double));
+        if (!result->data.field) {
+            grid_field_free(result);
+            return NULL;
+        }
+    }
+    
+    // Allocate work arrays
+    double *rhs = malloc(n * sizeof(double));
+    double *sol = malloc(n * sizeof(double));
+    double *a = malloc(n * sizeof(double));
+    double *b = malloc(n * sizeof(double));
+    double *c = malloc(n * sizeof(double));
+    
+    // Set up tridiagonal system for 4th-order Padé scheme
+    // (1/4)f'_{i-1} + f'_i + (1/4)f'_{i+1} = (3/2)(f_{i+1} - f_{i-1})/2h
+    for (uint32_t i = 0; i < n; i++) {
+        a[i] = (i > 0) ? 0.25 : 0.0;         // subdiagonal
+        b[i] = 1.0;                           // diagonal
+        c[i] = (i < n-1) ? 0.25 : 0.0;       // superdiagonal
+    }
+    
+    // Precompute strides for efficient linear index calculation
+    uint32_t *stride = grid->strides;  // Use cached strides from grid metadata
+    
+    // Calculate number of 1D slices perpendicular to axis
+    uint32_t slice_count = grid->total_points / n;
+    
+    // Process each 1D slice along the specified axis
+    uint32_t *idx = malloc(N_DIM * sizeof(uint32_t));
+    double *coords = malloc(sizeof(double) * grid->n_dims);
+    
+    // Build array of dimensions excluding axis
+    uint32_t *other_dims = malloc(grid->n_dims * sizeof(uint32_t));
+    int n_other_dims = 0;
+    for (int d = 0; d < grid->n_dims; d++) {
+        if (d != axis) {
+            other_dims[n_other_dims++] = grid->dims[d];
+        }
+    }
+    
+    // Precompute shifted neighbor fields to allow contiguous neighbor reads
+    GridField *gf_plus = grid_field_shift(field, axis, +1);
+    GridField *gf_minus = grid_field_shift(field, axis, -1);
+
+    for (uint32_t slice_id = 0; slice_id < slice_count; slice_id++) {
+        // Zero out all indices to avoid garbage in unused dimensions
+        for (int d = 0; d < N_DIM; d++) idx[d] = 0;
+        // Decode slice_id into grid indices (all dimensions except axis)
+        uint32_t temp = slice_id;
+        int other_idx = 0;
+        for (int d = 0; d < grid->n_dims; d++) {
+            if (d == axis) {
+                idx[d] = 0;  // Will be set in inner loop
+            } else {
+                idx[d] = temp % other_dims[other_idx];
+                temp /= other_dims[other_idx];
+                other_idx++;
+            }
+        }
+        // Debug: print decoded idx for first slice
+        // if (slice_id == 0) {
+        //     fprintf(stderr, "[compact] slice_id=%u idx=[", slice_id);
+        //     for (int d = 0; d < grid->n_dims; d++) fprintf(stderr, "%u ", idx[d]);
+        //     fprintf(stderr, "]\n");
+        // }
+        // For each slice we copy the template tridiagonal coeffs into local arrays
+        double *la = malloc(n * sizeof(double));
+        double *lb = malloc(n * sizeof(double));
+        double *lc = malloc(n * sizeof(double));
+        memcpy(la, a, n * sizeof(double));
+        memcpy(lb, b, n * sizeof(double));
+        memcpy(lc, c, n * sizeof(double));
+
+        // Build RHS using explicit stencil along this slice, but detect
+        // interior hyperplane boundaries and handle them locally by
+        // enforcing a direct value (set diag=1, off-diags=0)
+        // Precompute base offset for this slice to allow contiguous memory access
+        uint32_t base_offset = 0;
+        for (int d = 0; d < grid->n_dims; d++) {
+            if (d == axis) continue;
+            base_offset += idx[d] * grid->strides[d];
+        }
+        uint32_t axis_stride = grid->strides[axis];
+
+        for (uint32_t i = 0; i < n; i++) {
+            idx[axis] = i;
+
+            // Compute coordinate for current index
+            grid_index_to_coord(grid, idx, coords);
+
+            // Helper to fetch neighbors (safe even if out-of-range)
+            double f_minus = 0.0, f0 = 0.0, f_plus = 0.0;
+            // Use contiguous access into the underlying data arrays for speed
+            if (field->data.field) {
+                size_t off = base_offset + (size_t)i * axis_stride;
+                double *src = field->data.field;
+                double *src_p = gf_plus && gf_plus->data.field ? gf_plus->data.field : NULL;
+                double *src_m = gf_minus && gf_minus->data.field ? gf_minus->data.field : NULL;
+
+                f0 = src ? src[off] : 0.0;
+                f_minus = src_m ? src_m[off] : (i > 0 ? f0 : f0);
+                f_plus = src_p ? src_p[off] : (i + 1 < n ? f0 : f0);
+            } else {
+                f0 = f_minus = f_plus = 0.0;
+            }
+
+            // Reset idx[axis] back to current
+            idx[axis] = i;
+
+            bool handled_by_interior = false;
+
+            // Check interior boundaries if present
+            if (field->grid->n_interior_boundaries > 0) {
+                for (int ib = 0; ib < field->grid->n_interior_boundaries && !handled_by_interior; ib++) {
+                    HyperplaneBoundary *hb = &field->grid->interior_boundaries[ib];
+                    if (!hb->active) continue;
+
+                    // Quick bbox rejection with tolerance
+                    double tolerance = 1.0 * h;
+                    bool in_bbox = true;
+                    for (int d = 0; d < field->grid->n_dims; d++) {
+                        if (coords[d] < hb->bbox_min[d] - tolerance || coords[d] > hb->bbox_max[d] + tolerance) {
+                            in_bbox = false; break;
+                        }
+                    }
+                    if (!in_bbox) continue;
+
+                    // Compute distances for current, minus, plus
+                    double dist_current = 0.0, dist_minus = 0.0, dist_plus = 0.0;
+                    // current
+                    for (int d = 0; d < field->grid->n_dims; d++) {
+                        dist_current += hb->normal[d] * (coords[d] - hb->point[d]);
+                    }
+
+                    // minus coords
+                    uint32_t idx_minus[N_DIM], idx_plus[N_DIM];
+                    for (int d = 0; d < field->grid->n_dims; d++) {
+                        idx_minus[d] = idx[d]; idx_plus[d] = idx[d];
+                    }
+                    idx_minus[axis] = (i > 0) ? i - 1 : 0;
+                    idx_plus[axis] = (i + 1 < n) ? i + 1 : n - 1;
+                    double coords_minus[N_DIM], coords_plus[N_DIM];
+                    grid_index_to_coord(field->grid, idx_minus, coords_minus);
+                    grid_index_to_coord(field->grid, idx_plus, coords_plus);
+
+                    for (int d = 0; d < field->grid->n_dims; d++) {
+                        dist_minus += hb->normal[d] * (coords_minus[d] - hb->point[d]);
+                        dist_plus += hb->normal[d] * (coords_plus[d] - hb->point[d]);
+                    }
+
+                    // If stencil crosses boundary (points on opposite sides)
+                    if ((dist_minus * dist_plus < 0) || (dist_current * dist_minus < 0) || (dist_current * dist_plus < 0)) {
+                        bool current_in_bounds = point_in_bounded_hyperplane(hb, coords, field->grid->n_dims, h);
+                        bool minus_in_bounds = point_in_bounded_hyperplane(hb, coords_minus, field->grid->n_dims, h);
+                        bool plus_in_bounds = point_in_bounded_hyperplane(hb, coords_plus, field->grid->n_dims, h);
+
+                        if (current_in_bounds || minus_in_bounds || plus_in_bounds) {
+                            // Stencil crosses this bounded hyperplane within its region
+                            // Handle according to boundary type: mirror/reflect -> zero or one-sided
+                            if (hb->bc_spec.type == BC_REFLECT || hb->bc_spec.type == BC_NEUMANN) {
+                                // Mirror/Neumann behavior: attempt to mimic explicit handler
+                                double val = 0.0;
+                                // Reuse explicit logic: decide side and one-sided stencil
+                                if (fabs(dist_current) < h) {
+                                    val = 0.0;
+                                } else if (dist_current > 0) {
+                                    // on positive side
+                                    if (dist_minus < 0) {
+                                        // minus on other side -> forward one-sided if available
+                                        if (i + 2 < n) {
+                                            uint32_t tensor_idx_plus2[N_DIM];
+                                            for (int t = 0; t < N_DIM; t++) tensor_idx_plus2[t] = idx[t];
+                                            tensor_idx_plus2[axis] = i + 2;
+                                            double f2 = literal_get(&field->data, tensor_idx_plus2);
+                                            val = (f2 - 2.0 * f_plus + f0) / (h * h);
+                                        } else {
+                                            val = 0.0;
+                                        }
+                                    } else {
+                                        val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
+                                    }
+                                } else {
+                                    // on negative side
+                                    if (dist_plus > 0) {
+                                        if (i >= 2) {
+                                            uint32_t tensor_idx_minus2[N_DIM];
+                                            for (int t = 0; t < N_DIM; t++) tensor_idx_minus2[t] = idx[t];
+                                            tensor_idx_minus2[axis] = i - 2;
+                                            double fm2 = literal_get(&field->data, tensor_idx_minus2);
+                                            val = (f0 - 2.0 * f_minus + fm2) / (h * h);
+                                        } else {
+                                            val = 0.0;
+                                        }
+                                    } else {
+                                        val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
+                                    }
+                                }
+
+                                // Enforce value directly in tridiagonal system for this index
+                                la[i] = 0.0; lb[i] = 1.0; lc[i] = 0.0;
+                                rhs[i] = val;
+                                handled_by_interior = true;
+                            } else if (hb->bc_spec.type == BC_DIRICHLET) {
+                                // Dirichlet: set to bc value (approximate)
+                                double bc_val = hb->bc_spec.func ? hb->bc_spec.func(coords, hb->bc_spec.time) : hb->bc_spec.value;
+                                // For first derivative case, set to zero; for second, approximate zero curvature
+                                la[i] = 0.0; lb[i] = 1.0; lc[i] = 0.0;
+                                rhs[i] = 0.0;
+                                handled_by_interior = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If interior boundary was not handled, compute RHS normally
+            if (!handled_by_interior) {
+                if (order == 1) {
+                    if (i == 0) {
+                        rhs[i] = (1.5 / h) * (f_plus - f0);
+                    } else if (i == n-1) {
+                        rhs[i] = (1.5 / h) * (f0 - f_minus);
+                    } else {
+                        // Correct RHS scaling for Padé compact scheme:
+                        // (3/4) * (f_{i+1} - f_{i-1}) / h
+                        rhs[i] = (3.0 / (4.0 * h)) * (f_plus - f_minus);
+                    }
+                } else { // order == 2
+                    if (i == 0) {
+                        if (n > 2) {
+                            // use one-sided forward
+                            idx[axis] = 0; double ff0 = literal_get(&field->data, idx);
+                            idx[axis] = 1; double ff1 = literal_get(&field->data, idx);
+                            idx[axis] = 2; double ff2 = literal_get(&field->data, idx);
+                            rhs[i] = (ff2 - 2.0 * ff1 + ff0) / (h * h);
+                            idx[axis] = i;
+                        } else {
+                            rhs[i] = 0.0;
+                        }
+                    } else if (i == n-1) {
+                        if (n > 2) {
+                            idx[axis] = n-1; double ff0 = literal_get(&field->data, idx);
+                            idx[axis] = n-2; double ffm1 = literal_get(&field->data, idx);
+                            idx[axis] = n-3; double ffm2 = literal_get(&field->data, idx);
+                            rhs[i] = (ff0 - 2.0 * ffm1 + ffm2) / (h * h);
+                            idx[axis] = i;
+                        } else {
+                            rhs[i] = 0.0;
+                        }
+                    } else {
+                        rhs[i] = (f_plus - 2.0 * f0 + f_minus) / (h * h);
+                    }
+                }
+            }
+        }
+
+        // Solve tridiagonal system: Af' = RHS for this slice using local coeffs
+        thomas_solve(la, lb, lc, rhs, sol, n);
+
+        // Store solution back into result grid
+        for (uint32_t i = 0; i < n; i++) {
+            idx[axis] = i;
+            literal_set(&result->data, idx, sol[i]);
+        }
+
+        free(la); free(lb); free(lc);
+    }
+    
+    free(other_dims);
+    free(idx);
+    free(coords);
+    free(a);
+    free(b);
+    free(c);
+    free(rhs);
+    free(sol);
+    grid_field_free(gf_plus);
+    grid_field_free(gf_minus);
+    
+    return result;
+}
 
 GridField* grid_field_derivative(const GridField *field, int axis, int order) {
     if (!field || axis < 0 || axis >= field->grid->n_dims) return NULL;
@@ -431,455 +797,226 @@ GridField* grid_field_derivative(const GridField *field, int axis, int order) {
     
     double h = grid->spacing[axis];
     uint32_t n = grid->dims[axis];
-    
+
     if (n < 3) {
         grid_field_free(result);
         return NULL;
     }
-    
+
+    // Vectorized neighbor fields using grid shifts
+    GridField *f_plus = grid_field_shift(field, axis, +1);
+    GridField *f_minus = grid_field_shift(field, axis, -1);
+
+    // Compute vectorized result depending on requested order
+    GridField *scaled = NULL;
+    if (order == 1) {
+        // central differences: (f_plus - f_minus) / (2h)
+        GridField *diff = grid_field_subtract(f_plus, f_minus);
+        if (diff) {
+            double factor = 1.0 / (2.0 * h);
+            scaled = grid_field_scale(diff, factor);
+            grid_field_free(diff);
+        }
+    } else { // order == 2
+        // second derivative: (f_plus - 2*f0 + f_minus) / (h*h)
+        if (f_plus && f_minus) {
+            GridField *sum = grid_field_add(f_plus, f_minus); // f+ + f-
+            GridField *center2 = grid_field_scale(field, -2.0); // -2*f0
+            GridField *sum2 = NULL;
+            if (sum && center2) {
+                sum2 = grid_field_add(sum, center2); // f+ - 2f0 + f-
+            }
+            if (sum) grid_field_free(sum);
+            if (center2) grid_field_free(center2);
+            if (sum2) {
+                double factor = 1.0 / (h * h);
+                scaled = grid_field_scale(sum2, factor);
+                grid_field_free(sum2);
+            }
+        }
+    }
+
+    // If we couldn't compute vectorized result, fall back
+    if (!scaled) {
+        if (f_plus) grid_field_free(f_plus);
+        if (f_minus) grid_field_free(f_minus);
+        grid_field_free(result);
+        return NULL;
+    }
+
+    // Replace result data with scaled central difference
+    free(result->data.field);
+    result->data = scaled->data;
+    free(scaled);
+
+    // Now fix boundary points (edges and BCs) using the original per-point logic
     int n_dims = grid->n_dims;
-    uint32_t *indices = malloc(sizeof(uint32_t) * n_dims);
-    uint32_t *tensor_idx = malloc(sizeof(uint32_t) * N_DIM);
-    uint32_t *tensor_idx_minus = malloc(sizeof(uint32_t) * N_DIM);
-    uint32_t *tensor_idx_plus = malloc(sizeof(uint32_t) * N_DIM);
-    double *coords = malloc(sizeof(double) * n_dims);
-    
+    uint32_t indices[N_DIM];
+    uint32_t tensor_idx[N_DIM];
+    uint32_t tensor_idx_minus[N_DIM];
+    uint32_t tensor_idx_plus[N_DIM];
+    double coords[N_DIM];
+
     for (uint32_t linear = 0; linear < grid->total_points; linear++) {
         grid_linear_to_index(grid, linear, indices);
-        
-        // Convert to tensor indices
-        for (int i = 0; i < N_DIM; i++) {
-            tensor_idx[i] = (i < n_dims) ? indices[i] : 0;
-            tensor_idx_minus[i] = tensor_idx[i];
-            tensor_idx_plus[i] = tensor_idx[i];
-        }
-        
+        for (int i = 0; i < N_DIM; i++) tensor_idx[i] = (i < n_dims) ? indices[i] : 0;
         uint32_t idx = indices[axis];
-        
-        // First check interior boundaries
-        bool boundary_handled = false;
-        double boundary_val = 0.0;
-        
-        // Get physical coordinates for boundary checking
-        grid_index_to_coord(field->grid, indices, coords);
-        
-        // Check interior hyperplane boundaries with bounding box optimization
-        for (int ib = 0; ib < field->grid->n_interior_boundaries && !boundary_handled; ib++) {
-            HyperplaneBoundary *hb = &field->grid->interior_boundaries[ib];
-            if (!hb->active) continue;
-            
-            // Bounding box rejection test (with tolerance for stencil)
-            double tolerance = 1.0 * h;  // Stencil width
-            bool in_bbox = true;
-            for (int d = 0; d < field->grid->n_dims; d++) {
-                if (coords[d] < hb->bbox_min[d] - tolerance || 
-                    coords[d] > hb->bbox_max[d] + tolerance) {
-                    in_bbox = false;
-                    break;
-                }
-            }
-            if (!in_bbox) continue;
-            
-            // Compute signed distance to hyperplane: d = n · (p - p0)
-            double dist = 0.0;
-            for (int d = 0; d < field->grid->n_dims; d++) {
-                dist += hb->normal[d] * (coords[d] - hb->point[d]);
-            }
-            
-            // Check if near boundary (within stencil width)
-            if (fabs(dist) > tolerance) continue;
-            
-            // Check if point is within the bounded segment
-            if (!point_in_bounded_hyperplane(hb, coords, field->grid->n_dims, tolerance)) {
-                continue;
-            }
-            
-            // Apply boundary condition based on type
+
+        // Boundary handling for first/last index
+        if (idx == 0 || idx == n - 1) {
+            // Recompute using one-sided formula + BCs similar to original implementation
+            grid_index_to_coord(field->grid, indices, coords);
+            tensor_idx_minus[0] = tensor_idx[0]; tensor_idx_plus[0] = tensor_idx[0];
+            for (int i = 0; i < N_DIM; i++) { tensor_idx_minus[i] = tensor_idx[i]; tensor_idx_plus[i] = tensor_idx[i]; }
+
+            BoundarySpec *bc = (idx == 0) ? &grid->boundaries[axis * 2] : &grid->boundaries[axis * 2 + 1];
+
             if (order == 1) {
-                // First derivative
-                if (hb->bc_spec.type == BC_REFLECT || hb->bc_spec.type == BC_NEUMANN) {
-                    // Zero normal derivative: ∂u/∂n = 0
-                    // For reflecting barriers, apply boundary condition from both sides
-                    // by checking if the derivative direction has ANY component along the normal
-                    double normal_component = fabs(hb->normal[axis]);
-                    if (normal_component > 0.01) {  // Any non-zero alignment
-                        boundary_val = 0.0;
-                        boundary_handled = true;
-                        // Debug: First occurrence only
-                        static int first_call = 1;
-                        if (first_call) {
-                            printf("[DEBUG] Interior boundary handling: order=1, BC_REFLECT at boundary %d\n", ib);
-                            printf("        coords=(%.3f, %.3f), normal=(%.3f, %.3f), axis=%d\n",
-                                   coords[0], coords[1], hb->normal[0], hb->normal[1], axis);
-                            first_call = 0;
-                        }
-                    }
-                } else if (hb->bc_spec.type == BC_DIRICHLET) {
-                    // For Dirichlet, enforce derivative using ghost point
-                    // Similar to edge handling below
-                    double bc_val = hb->bc_spec.func ? hb->bc_spec.func(coords, hb->bc_spec.time) : hb->bc_spec.value;
-                    double normal_component = hb->normal[axis];
-                    if (fabs(normal_component) > 0.1) {
-                        // Approximate derivative at boundary
-                        // For now, set to zero (will improve with proper ghost point)
-                        boundary_val = 0.0;
-                        boundary_handled = true;
-                    }
-                }
-            } else if (order == 2) {
-                // Second derivative
-                if (hb->bc_spec.type == BC_REFLECT || hb->bc_spec.type == BC_NEUMANN) {
-                    // For reflecting boundary, second derivative along normal is zero
-                    // Apply from both sides by using absolute value
-                    double normal_component = fabs(hb->normal[axis]);
-                    if (normal_component > 0.01) {  // Any non-zero alignment
-                        boundary_val = 0.0;
-                        boundary_handled = true;
-                        // Debug: First occurrence only
-                        static int first_call_order2 = 1;
-                        if (first_call_order2) {
-                            printf("[DEBUG] Interior boundary handling: order=2, BC_REFLECT at boundary %d\n", ib);
-                            printf("        coords=(%.3f, %.3f), normal=(%.3f, %.3f), axis=%d\n",
-                                   coords[0], coords[1], hb->normal[0], hb->normal[1], axis);
-                            first_call_order2 = 0;
-                        }
-                    }
-                } else if (hb->bc_spec.type == BC_DIRICHLET) {
-                    // For Dirichlet at boundary, second derivative needs ghost points
-                    // Set to zero for now (will improve with proper implementation)
-                    double normal_component = hb->normal[axis];
-                    if (fabs(normal_component) > 0.1) {
-                        boundary_val = 0.0;
-                        boundary_handled = true;
-                    }
-                }
-            }
-        }
-        
-        // If interior boundary handled it, set value and continue
-        if (boundary_handled) {
-            literal_set(&result->data, tensor_idx, boundary_val);
-            continue;
-        }
-        
-        if (order == 1) {
-            if (idx == 0) {
-                // Minimum boundary
-                BoundarySpec *bc = &grid->boundaries[axis * 2];
-                
-                switch (bc->type) {
-                    case BC_DIRICHLET:
-                        // Dirichlet: use ghost point
-                        grid_index_to_coord(grid, indices, coords);
-                        {
+                if (idx == 0) {
+                    switch (bc->type) {
+                        case BC_DIRICHLET: {
                             double bc_val = bc->func ? bc->func(coords, bc->time) : bc->value;
                             tensor_idx_plus[axis] = idx + 1;
                             double f1 = literal_get(&field->data, tensor_idx_plus);
                             double val = (f1 - bc_val) / (2.0 * h);
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                        
-                    case BC_REFLECT:
-                        // Reflection: du/dn = 0 at boundary (like Neumann)
-                        literal_set(&result->data, tensor_idx, 0.0);
-                        break;
-                        
-                    case BC_OPEN:
-                    case BC_NEUMANN:
-                    default:
-                        // Open/Neumann: use one-sided difference
-                        tensor_idx_plus[axis] = idx + 1;
-                        {
+                        case BC_NEUMANN: {
+                            double g = bc->func ? bc->func(coords, bc->time) : bc->value;
+                            literal_set(&result->data, tensor_idx, g);
+                            break;
+                        }
+                        case BC_REFLECT: {
+                            literal_set(&result->data, tensor_idx, 0.0);
+                            break;
+                        }
+                        case BC_OPEN:
+                        default: {
+                            tensor_idx_plus[axis] = idx + 1;
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f1 = literal_get(&field->data, tensor_idx_plus);
                             double val = (f1 - f0) / h;
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                }
-            } else if (idx == n - 1) {
-                // Maximum boundary
-                BoundarySpec *bc = &grid->boundaries[axis * 2 + 1];
-                
-                switch (bc->type) {
-                    case BC_DIRICHLET:
-                        // Dirichlet: use ghost point
-                        grid_index_to_coord(grid, indices, coords);
-                        {
+                    }
+                } else { // idx == n-1
+                    switch (bc->type) {
+                        case BC_DIRICHLET: {
                             double bc_val = bc->func ? bc->func(coords, bc->time) : bc->value;
                             tensor_idx_minus[axis] = idx - 1;
                             double f_minus = literal_get(&field->data, tensor_idx_minus);
                             double val = (bc_val - f_minus) / (2.0 * h);
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                        
-                    case BC_REFLECT:
-                        // Reflection: du/dn = 0 at boundary
-                        literal_set(&result->data, tensor_idx, 0.0);
-                        break;
-                        
-                    case BC_OPEN:
-                    case BC_NEUMANN:
-                    default:
-                        // Open/Neumann: use one-sided difference
-                        tensor_idx_minus[axis] = idx - 1;
-                        {
+                        case BC_REFLECT: {
+                            literal_set(&result->data, tensor_idx, 0.0);
+                            break;
+                        }
+                        case BC_NEUMANN: {
+                            double g = bc->func ? bc->func(coords, bc->time) : bc->value;
+                            literal_set(&result->data, tensor_idx, g);
+                            break;
+                        }
+                        case BC_OPEN:
+                        default: {
+                            tensor_idx_minus[axis] = idx - 1;
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f_minus = literal_get(&field->data, tensor_idx_minus);
                             double val = (f0 - f_minus) / h;
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
+                    }
                 }
-            } else {
-                // Interior: central difference
-                tensor_idx_minus[axis] = idx - 1;
-                tensor_idx_plus[axis] = idx + 1;
-                double f_minus = literal_get(&field->data, tensor_idx_minus);
-                double f_plus = literal_get(&field->data, tensor_idx_plus);
-                double val = (f_plus - f_minus) / (2.0 * h);
-                literal_set(&result->data, tensor_idx, val);
-            }
-        } else { // order == 2
-            if (idx == 0) {
-                // Minimum boundary - second derivative
-                BoundarySpec *bc = &grid->boundaries[axis * 2];
-                
-                switch (bc->type) {
-                    case BC_DIRICHLET:
-                        // Use ghost point for Dirichlet
-                        grid_index_to_coord(grid, indices, coords);
-                        {
+            } else { // order == 2
+                if (idx == 0) {
+                    switch (bc->type) {
+                        case BC_DIRICHLET: {
                             double bc_val = bc->func ? bc->func(coords, bc->time) : bc->value;
                             tensor_idx_plus[axis] = idx + 1;
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f1 = literal_get(&field->data, tensor_idx_plus);
                             double val = (bc_val - 2.0 * f0 + f1) / (h * h);
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                        
-                    case BC_OPEN: {
-                        // Open boundary for sponge layer absorption:
-                        // Set second derivative to zero to avoid imposing smoothness
-                        // This prevents artificial reflections that occur when using
-                        // one-sided stencils that enforce derivative continuity.
-                        // The sponge layer damping (applied in wave equation) handles absorption.
-                        literal_set(&result->data, tensor_idx, 0.0);
-                        break;
-                    }
-                        
-                    case BC_NEUMANN:
-                    case BC_REFLECT:
-                    default:
-                        // Neumann/Reflect: use one-sided second derivative
-                        tensor_idx_plus[axis] = idx + 1;
-                        {
+                        case BC_NEUMANN: {
+                            tensor_idx_plus[axis] = idx + 1;
+                            double f0 = literal_get(&field->data, tensor_idx);
+                            double f1 = literal_get(&field->data, tensor_idx_plus);
+                            double g = bc->func ? bc->func(coords, bc->time) : bc->value;
+                            double val = (2.0 * (f1 - f0) - 2.0 * h * g) / (h * h);
+                            literal_set(&result->data, tensor_idx, val);
+                            break;
+                        }
+                        case BC_OPEN: {
+                            literal_set(&result->data, tensor_idx, 0.0);
+                            break;
+                        }
+                        case BC_REFLECT:
+                        default: {
+                            tensor_idx_plus[axis] = idx + 1;
                             uint32_t tensor_idx_plus2[N_DIM];
                             for (int i = 0; i < N_DIM; i++) tensor_idx_plus2[i] = tensor_idx[i];
                             tensor_idx_plus2[axis] = idx + 2;
-                            
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f1 = literal_get(&field->data, tensor_idx_plus);
                             double f2 = literal_get(&field->data, tensor_idx_plus2);
                             double val = (f2 - 2.0 * f1 + f0) / (h * h);
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                }
-            } else if (idx == n - 1) {
-                // Maximum boundary - second derivative
-                BoundarySpec *bc = &grid->boundaries[axis * 2 + 1];
-                
-                switch (bc->type) {
-                    case BC_DIRICHLET:
-                        // Use ghost point for Dirichlet
-                        grid_index_to_coord(grid, indices, coords);
-                        {
+                    }
+                } else { // idx == n-1
+                    switch (bc->type) {
+                        case BC_DIRICHLET: {
                             double bc_val = bc->func ? bc->func(coords, bc->time) : bc->value;
                             tensor_idx_minus[axis] = idx - 1;
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f_minus = literal_get(&field->data, tensor_idx_minus);
                             double val = (f_minus - 2.0 * f0 + bc_val) / (h * h);
                             literal_set(&result->data, tensor_idx, val);
+                            break;
                         }
-                        break;
-                        
-                    case BC_OPEN: {
-                        // Open boundary for sponge layer absorption:
-                        // Set second derivative to zero to avoid imposing smoothness
-                        // This prevents artificial reflections that occur when using
-                        // one-sided stencils that enforce derivative continuity.
-                        // The sponge layer damping (applied in wave equation) handles absorption.
-                        literal_set(&result->data, tensor_idx, 0.0);
-                        break;
-                    }
-                        
-                    case BC_NEUMANN:
-                    case BC_REFLECT:
-                    default:
-                        // Neumann/Reflect: use one-sided second derivative
-                        tensor_idx_minus[axis] = idx - 1;
-                        {
+                        case BC_NEUMANN: {
+                            tensor_idx_minus[axis] = idx - 1;
+                            double f0 = literal_get(&field->data, tensor_idx);
+                            double f_minus = literal_get(&field->data, tensor_idx_minus);
+                            double g = bc->func ? bc->func(coords, bc->time) : bc->value;
+                            double val = (2.0 * (f_minus - f0) + 2.0 * h * g) / (h * h);
+                            literal_set(&result->data, tensor_idx, val);
+                            break;
+                        }
+                        case BC_OPEN: {
+                            literal_set(&result->data, tensor_idx, 0.0);
+                            break;
+                        }
+                        case BC_REFLECT:
+                        default: {
+                            tensor_idx_minus[axis] = idx - 1;
                             uint32_t tensor_idx_minus2[N_DIM];
                             for (int i = 0; i < N_DIM; i++) tensor_idx_minus2[i] = tensor_idx[i];
                             tensor_idx_minus2[axis] = idx - 2;
-                            
                             double f0 = literal_get(&field->data, tensor_idx);
                             double f_minus = literal_get(&field->data, tensor_idx_minus);
                             double f_minus2 = literal_get(&field->data, tensor_idx_minus2);
                             double val = (f0 - 2.0 * f_minus + f_minus2) / (h * h);
                             literal_set(&result->data, tensor_idx, val);
-                        }
-                        break;
-                }
-            } else {
-                // Interior: central second difference, but check for interior boundaries
-                tensor_idx_minus[axis] = idx - 1;
-                tensor_idx_plus[axis] = idx + 1;
-                
-                // Check if stencil crosses any interior boundary
-                bool stencil_crosses_boundary = false;
-                int crossed_boundary_id = -1;
-                
-                if (field->grid->n_interior_boundaries > 0) {
-                    // Get coordinates for stencil points
-                    uint32_t idx_minus[N_DIM], idx_plus[N_DIM];
-                    for (int i = 0; i < n_dims; i++) {
-                        idx_minus[i] = indices[i];
-                        idx_plus[i] = indices[i];
-                    }
-                    idx_minus[axis] = (idx > 0) ? idx - 1 : 0;
-                    idx_plus[axis] = (idx < n - 1) ? idx + 1 : n - 1;
-                    
-                    double coords_minus[N_DIM], coords_plus[N_DIM];
-                    grid_index_to_coord(field->grid, idx_minus, coords_minus);
-                    grid_index_to_coord(field->grid, idx_plus, coords_plus);
-                    
-                    // Check each interior boundary
-                    for (int ib = 0; ib < field->grid->n_interior_boundaries && !stencil_crosses_boundary; ib++) {
-                        HyperplaneBoundary *hb = &field->grid->interior_boundaries[ib];
-                        if (!hb->active) continue;
-                        
-                        // Compute signed distances
-                        double dist_current = 0.0, dist_minus = 0.0, dist_plus = 0.0;
-                        for (int d = 0; d < field->grid->n_dims; d++) {
-                            dist_current += hb->normal[d] * (coords[d] - hb->point[d]);
-                            dist_minus += hb->normal[d] * (coords_minus[d] - hb->point[d]);
-                            dist_plus += hb->normal[d] * (coords_plus[d] - hb->point[d]);
-                        }
-                        
-                        // Check if stencil crosses boundary (points on opposite sides)
-                        if ((dist_minus * dist_plus < 0) || (dist_current * dist_minus < 0) || (dist_current * dist_plus < 0)) {
-                            // Check if any of the points are actually within the bounded segment
-                            bool current_in_bounds = point_in_bounded_hyperplane(hb, coords, field->grid->n_dims, h);
-                            bool minus_in_bounds = point_in_bounded_hyperplane(hb, coords_minus, field->grid->n_dims, h);
-                            bool plus_in_bounds = point_in_bounded_hyperplane(hb, coords_plus, field->grid->n_dims, h);
-                            
-                            if (current_in_bounds || minus_in_bounds || plus_in_bounds) {
-                                // Stencil crosses this boundary within its bounded region
-                                stencil_crosses_boundary = true;
-                                crossed_boundary_id = ib;
-                            }
+                            break;
                         }
                     }
                 }
-                
-                double f_minus = literal_get(&field->data, tensor_idx_minus);
-                double f0 = literal_get(&field->data, tensor_idx);
-                double f_plus = literal_get(&field->data, tensor_idx_plus);
-                double val;
-                
-                if (stencil_crosses_boundary && crossed_boundary_id >= 0) {
-                    HyperplaneBoundary *hb = &field->grid->interior_boundaries[crossed_boundary_id];
-                    
-                    if (hb->bc_spec.type == BC_REFLECT) {
-                        // For reflecting boundary, use ghost points that mirror across boundary
-                        // Determine which side of boundary we're on
-                        double dist_current = 0.0;
-                        for (int d = 0; d < field->grid->n_dims; d++) {
-                            dist_current += hb->normal[d] * (coords[d] - hb->point[d]);
-                        }
-                        
-                        // Use one-sided stencil away from boundary
-                        if (fabs(dist_current) < h) {
-                            // Very close to boundary - set second derivative to zero
-                            val = 0.0;
-                        } else if (dist_current > 0) {
-                            // On positive side - use forward stencil if minus crosses
-                            double dist_minus = 0.0;
-                            for (int d = 0; d < field->grid->n_dims; d++) {
-                                uint32_t idx_m[N_DIM];
-                                for (int j = 0; j < n_dims; j++) idx_m[j] = indices[j];
-                                idx_m[axis] = idx - 1;
-                                double coords_m[N_DIM];
-                                grid_index_to_coord(field->grid, idx_m, coords_m);
-                                dist_minus += hb->normal[d] * (coords_m[d] - hb->point[d]);
-                            }
-                            
-                            if (dist_minus < 0) {
-                                // Minus point is on other side - use one-sided forward
-                                uint32_t tensor_idx_plus2[N_DIM];
-                                for (int i = 0; i < N_DIM; i++) tensor_idx_plus2[i] = tensor_idx[i];
-                                tensor_idx_plus2[axis] = idx + 2;
-                                if (idx + 2 < n) {
-                                    double f2 = literal_get(&field->data, tensor_idx_plus2);
-                                    val = (f2 - 2.0 * f_plus + f0) / (h * h);
-                                } else {
-                                    val = 0.0;
-                                }
-                            } else {
-                                val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
-                            }
-                        } else {
-                            // On negative side - use backward stencil if plus crosses
-                            double dist_plus = 0.0;
-                            for (int d = 0; d < field->grid->n_dims; d++) {
-                                uint32_t idx_p[N_DIM];
-                                for (int j = 0; j < n_dims; j++) idx_p[j] = indices[j];
-                                idx_p[axis] = idx + 1;
-                                double coords_p[N_DIM];
-                                grid_index_to_coord(field->grid, idx_p, coords_p);
-                                dist_plus += hb->normal[d] * (coords_p[d] - hb->point[d]);
-                            }
-                            
-                            if (dist_plus > 0) {
-                                // Plus point is on other side - use one-sided backward
-                                uint32_t tensor_idx_minus2[N_DIM];
-                                for (int i = 0; i < N_DIM; i++) tensor_idx_minus2[i] = tensor_idx[i];
-                                tensor_idx_minus2[axis] = idx - 2;
-                                if (idx >= 2) {
-                                    double f_minus2 = literal_get(&field->data, tensor_idx_minus2);
-                                    val = (f0 - 2.0 * f_minus + f_minus2) / (h * h);
-                                } else {
-                                    val = 0.0;
-                                }
-                            } else {
-                                val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
-                            }
-                        }
-                    } else {
-                        // For other boundary types, use standard central difference
-                        val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
-                    }
-                } else {
-                    // No boundary crossing - standard central difference
-                    val = (f_plus - 2.0 * f0 + f_minus) / (h * h);
-                }
-                
-                literal_set(&result->data, tensor_idx, val);
             }
         }
     }
-    
-    free(coords);
-    free(indices);
-    free(tensor_idx);
-    free(tensor_idx_minus);
-    free(tensor_idx_plus);
-    
+
+    // indices/coords are stack-allocated; nothing to free
+
+    grid_field_free(f_plus);
+    grid_field_free(f_minus);
     return result;
 }
 
@@ -898,8 +1035,74 @@ GridField* grid_field_laplacian(const GridField *field) {
     }
     
     // Add second derivatives for each dimension
+    // Skip dimensions with size 1 (no variation in that direction)
     for (int axis = 0; axis < grid->n_dims; axis++) {
+        // Skip dimensions with only 1 point (no derivative possible)
+        if (grid->dims[axis] <= 1) continue;
+        
         GridField *d2 = grid_field_derivative(field, axis, 2);
+        if (d2) {
+            // Add d2 to result using literal_add
+            Literal *sum = literal_add(&result->data, &d2->data);
+            if (sum) {
+                free(result->data.field);
+                result->data = *sum;
+                free(sum); // Free wrapper
+            }
+            grid_field_free(d2);
+        }
+    }
+    
+    return result;
+}
+
+// In-place variant: write Laplacian of `field` into preallocated `out`.
+int grid_field_laplacian_into(const GridField *field, GridField *out) {
+    if (!field || !out) return 1;
+    if (field->grid != out->grid) return 1;
+
+    GridMetadata *grid = field->grid;
+    size_t total = literal_total_elements(&out->data);
+    if (total == 0 || !out->data.field) return 1;
+
+    // zero out output
+    for (size_t i = 0; i < total; i++) out->data.field[i] = 0.0;
+
+    // accumulate second derivatives
+    for (int axis = 0; axis < grid->n_dims; axis++) {
+        if (grid->dims[axis] <= 1) continue;
+        GridField *d2 = grid_field_derivative_compact(field, axis, 2);
+        if (!d2) continue;
+        size_t t2 = literal_total_elements(&d2->data);
+        if (t2 == total && d2->data.field) {
+            for (size_t i = 0; i < total; i++) out->data.field[i] += d2->data.field[i];
+        }
+        grid_field_free(d2);
+    }
+    return 0;
+}
+
+// Compute Laplacian using compact finite differences (4th order)
+GridField* grid_field_laplacian_compact(const GridField *field) {
+    if (!field) return NULL;
+    
+    GridMetadata *grid = field->grid;
+    GridField *result = grid_field_create(grid);
+    if (!result) return NULL;
+    
+    // Initialize result to zero
+    size_t total = literal_total_elements(&result->data);
+    if (total > 0 && result->data.field) {
+        memset(result->data.field, 0, sizeof(double) * total);
+    }
+    
+    // Add second derivatives for each dimension using compact method
+    // Skip dimensions with size 1 (no variation in that direction)
+    for (int axis = 0; axis < grid->n_dims; axis++) {
+        // Skip dimensions with only 1 point (no derivative possible)
+        if (grid->dims[axis] <= 1) continue;
+        
+        GridField *d2 = grid_field_derivative_compact(field, axis, 2);
         if (d2) {
             // Add d2 to result using literal_add
             Literal *sum = literal_add(&result->data, &d2->data);
@@ -991,6 +1194,39 @@ GridField* grid_field_scale(const GridField *field, double scalar) {
     return result;
 }
 
+void grid_field_scale_inplace(GridField *field, double scalar) {
+    if (!field || !field->data.field) return;
+    uint64_t size = literal_total_elements(&field->data);
+    for (uint64_t i = 0; i < size; i++) field->data.field[i] *= scalar;
+}
+
+int grid_field_axpy(GridField *y, double a, const GridField *x) {
+    if (!y || !x) return 1;
+    if (y->grid != x->grid) return 1;
+    if (!y->data.field || !x->data.field) return 1;
+    uint64_t size = literal_total_elements(&y->data);
+    for (uint64_t i = 0; i < size; i++) y->data.field[i] += a * x->data.field[i];
+    return 0;
+}
+
+int grid_field_pointwise_multiply_into(const GridField *a, const GridField *b, GridField *out) {
+    if (!a || !b || !out) return 1;
+    if (a->grid != b->grid || a->grid != out->grid) return 1;
+    if (!a->data.field || !b->data.field || !out->data.field) return 1;
+    uint64_t size = literal_total_elements(&out->data);
+    for (uint64_t i = 0; i < size; i++) out->data.field[i] = a->data.field[i] * b->data.field[i];
+    return 0;
+}
+
+int grid_field_copy_into(const GridField *src, GridField *dst) {
+    if (!src || !dst) return 1;
+    if (src->grid != dst->grid) return 1;
+    uint64_t size = literal_total_elements(&src->data);
+    if (!src->data.field || !dst->data.field) return 1;
+    memcpy(dst->data.field, src->data.field, sizeof(double) * size);
+    return 0;
+}
+
 // Update grid_field_norm to use literal_norm on data tensor
 double grid_field_norm(const GridField *field) {
     if (!field) return 0.0;
@@ -1017,6 +1253,83 @@ GridField* grid_field_copy(const GridField *field) {
     }
     
     return copy;
+}
+
+// Element-wise subtraction of two grid fields
+GridField* grid_field_subtract(const GridField *a, const GridField *b) {
+    if (!a || !b) return NULL;
+    if (a->grid != b->grid) return NULL;
+
+    GridField *result = grid_field_create(a->grid);
+    if (!result) return NULL;
+
+    Literal *diff = literal_subtract((Literal*)&a->data, (Literal*)&b->data);
+    if (diff) {
+        free(result->data.field);
+        result->data = *diff;
+        free(diff);
+    }
+    return result;
+}
+
+// Shift a grid field along a given axis by integer steps (positive shifts toward +axis).
+// This uses contiguous block copies to avoid per-element loops when possible.
+GridField* grid_field_shift(const GridField *field, int axis, int shift) {
+    if (!field) return NULL;
+    if (axis < 0 || axis >= field->grid->n_dims) return NULL;
+    GridMetadata *grid = field->grid;
+    uint32_t n = grid->dims[axis];
+
+    GridField *out = grid_field_create(grid);
+    if (!out) return NULL;
+
+    // If source is all-zero, return zeroed out field
+    if (!field->data.field) return out;
+
+    double *src = field->data.field;
+    double *dst = out->data.field;
+    uint32_t total = grid->total_points;
+
+    uint32_t slice_count = total / n;
+
+    // Build list of other dimensions
+    uint32_t *other_dims = malloc(grid->n_dims * sizeof(uint32_t));
+    int n_other = 0;
+    for (int d = 0; d < grid->n_dims; d++) {
+        if (d == axis) continue;
+        other_dims[n_other++] = grid->dims[d];
+    }
+
+    uint32_t *indices = malloc(N_DIM * sizeof(uint32_t));
+    uint32_t *src_indices = malloc(N_DIM * sizeof(uint32_t));
+    for (uint32_t linear = 0; linear < total; linear++) {
+        // decode linear index into multi-index
+        uint32_t tmp = linear;
+        for (int d = 0; d < grid->n_dims; d++) {
+            uint32_t s = grid->strides[d];
+            indices[d] = tmp / s;
+            tmp = tmp % s;
+        }
+
+        // build source indices (apply shift: positive shift reads from higher index)
+        for (int d = 0; d < grid->n_dims; d++) src_indices[d] = indices[d];
+        int src_k = (int)indices[axis] + shift;
+        if (src_k < 0 || src_k >= (int)n) {
+            dst[linear] = 0.0;
+            continue;
+        }
+        src_indices[axis] = (uint32_t)src_k;
+
+        // compute source linear index
+        uint32_t src_lin = 0;
+        for (int d = 0; d < grid->n_dims; d++) src_lin += src_indices[d] * grid->strides[d];
+        dst[linear] = src[src_lin];
+    }
+
+    free(other_dims);
+    free(indices);
+    free(src_indices);
+    return out;
 }
 
 // ============================================================================
