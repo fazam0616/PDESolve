@@ -39,6 +39,10 @@ $(BUILD_DIR)/interactive_wave_sim: $(OBJ_FILES) $(BUILD_DIR)/interactive_wave_si
 # Special dependency: interactive_wave_sim.o depends on its .inc file
 $(BUILD_DIR)/interactive_wave_sim.o: $(EXAMPLES_DIR)/interactive_wave_sim_menu.inc
 
+# Build general example executables: link core objects + example object, include SDL
+$(BUILD_DIR)/%: $(OBJ_FILES) $(BUILD_DIR)/%.o
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ -lm $(LDFLAGS) $(SDL_LDFLAGS)
+
 # Compile source files
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
