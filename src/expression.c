@@ -444,7 +444,7 @@ Literal* expression_evaluate_grid(Expression *expr, Dictionary *vars, GridMetada
                         
                         // Wrap literal as GridField, apply derivative, unwrap result
                         GridField *field = grid_field_wrap_literal(operand, grid);
-                        GridField *deriv = grid_field_derivative(field, axis, 1);
+                        GridField *deriv = grid_field_derivative_compact(field, axis, 1);
                         
                         if (deriv) {
                             result = literal_copy(&deriv->data);
@@ -467,7 +467,7 @@ Literal* expression_evaluate_grid(Expression *expr, Dictionary *vars, GridMetada
                     if (grid_literal_matches(operand, grid)) {
                         // Apply Laplacian on grid (sum of second derivatives)
                         GridField *field = grid_field_wrap_literal(operand, grid);
-                        GridField *laplacian = grid_field_laplacian(field);
+                        GridField *laplacian = grid_field_laplacian_compact(field);
                         
                         if (laplacian) {
                             result = literal_copy(&laplacian->data);

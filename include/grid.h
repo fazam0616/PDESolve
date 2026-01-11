@@ -10,6 +10,147 @@
 // ============================================================================
 
 typedef enum {
+    BC_DIRICHLET,
+    BC_NEUMANN,
+    BC_ROBIN,
+    BC_PERIODIC,
+    BC_OPEN,
+    BC_REFLECT
+} BoundaryType;
+
+typedef double (*BCFunction)(const double *coords, double t);
+
+typedef struct {
+    BoundaryType type;
+    double value;
+    BCFunction func;
+    double time;
+    double alpha, beta, gamma;
+    double reflection_coeff;
+    int extrapolation_order;
+} BoundarySpec;
+
+typedef struct {
+    double *normal;
+    double *point;
+    double *bounds_min;
+    double *bounds_max;
+    double *bbox_min;
+    double *bbox_max;
+    BoundarySpec bc_spec;
+    bool active;
+} HyperplaneBoundary;
+
+// ============================================================================
+// Grid Metadata
+// ============================================================================
+
+typedef struct GridMetadata {
+    uint32_t *dims;
+    double *spacing;
+    double *origin;
+    uint32_t total_points;
+    double *extent;
+    BoundarySpec *boundaries;
+    HyperplaneBoundary *interior_boundaries;
+    int n_interior_boundaries;
+    int n_dims;
+    int refcount;
+    uint32_t *strides; /* precomputed strides */
+} GridMetadata;
+
+GridMetadata* grid_metadata_create(const uint32_t *dims,
+                                   const double *spacing,
+                                   const double *origin,
+                                   int n_dims);
+void grid_metadata_free(GridMetadata *grid);
+void grid_metadata_retain(GridMetadata *grid);
+uint32_t grid_get_total_points(const GridMetadata *grid);
+uint32_t grid_index_to_linear(const GridMetadata *grid, const uint32_t *indices);
+void grid_linear_to_index(const GridMetadata *grid, uint32_t linear, uint32_t *indices);
+void grid_index_to_coord(const GridMetadata *grid, const uint32_t* indices, double* coords);
+bool grid_coord_to_index(const GridMetadata *grid, const double* coords, uint32_t* indices);
+bool grid_is_boundary(const GridMetadata *grid, const uint32_t* indices);
+
+// ============================================================================
+// Grid Field
+// ============================================================================
+
+typedef struct {
+    char *name;
+    GridMetadata *grid;
+    Literal data;
+} GridField;
+
+GridField* grid_field_create(GridMetadata *grid);
+void grid_field_free(GridField *field);
+Literal* grid_field_get(const GridField *field, const uint32_t *indices);
+void grid_field_set(GridField *field, const uint32_t *indices, const Literal* value);
+Literal grid_field_evaluate(const GridField *field, const double *coords);
+void grid_field_fill(GridField *field, const Literal* value);
+void grid_field_init_from_function(GridField *field, Literal* (*func)(const double *coords, int n_dims));
+
+GridField* grid_field_derivative(const GridField *field, int axis, int order);
+GridField* grid_field_derivative_compact(const GridField *field, int axis, int order);
+GridField* grid_field_laplacian(const GridField *field);
+int grid_field_laplacian_into(const GridField *field, GridField *out);
+GridField* grid_field_laplacian_compact(const GridField *field);
+GridField** grid_field_gradient(const GridField *field);
+
+GridField* grid_field_add(const GridField *a, const GridField *b);
+GridField* grid_field_multiply(const GridField *a, const GridField *b);
+GridField* grid_field_scale(const GridField *field, double scalar);
+void grid_field_scale_inplace(GridField *field, double scalar);
+int grid_field_axpy(GridField *y, double a, const GridField *x);
+int grid_field_pointwise_multiply_into(const GridField *a, const GridField *b, GridField *out);
+int grid_field_copy_into(const GridField *src, GridField *dst);
+double grid_field_norm(const GridField *field);
+GridField* grid_field_copy(const GridField *field);
+GridField* grid_field_subtract(const GridField *a, const GridField *b);
+GridField* grid_field_shift(const GridField *field, int axis, int shift);
+GridField* grid_field_wrap_literal(Literal *lit, GridMetadata *grid);
+
+const char* grid_axis_name(int axis);
+int grid_axis_from_name(const char *name);
+bool grid_literal_matches(const Literal *lit, const GridMetadata *grid);
+
+void grid_set_boundary(GridMetadata *grid, int axis, int side,
+                       BoundaryType type, double value);
+void grid_set_boundary_func(GridMetadata *grid, int axis, int side,
+                            BoundaryType type, BCFunction func);
+void grid_set_robin_boundary(GridMetadata *grid, int axis, int side,
+                             double alpha, double beta, double gamma);
+void grid_set_open_boundary(GridMetadata *grid, int axis, int side, int order);
+int grid_add_hyperplane_boundary(GridMetadata *grid,
+                                 const double *normal,
+                                 const double *point,
+                                 const double *bounds_min,
+                                 const double *bounds_max,
+                                 BoundaryType type,
+                                 double value);
+int grid_add_hyperplane_boundary_func(GridMetadata *grid,
+                                      const double *normal,
+                                      const double *point,
+                                      const double *bounds_min,
+                                      const double *bounds_max,
+                                      BoundaryType type,
+                                      BCFunction func);
+int grid_point_near_boundary(const GridMetadata *grid, const double *coords);
+void grid_update_bc_time(GridMetadata *grid, double t);
+
+#endif // GRID_H
+#ifndef GRID_H
+#define GRID_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "literal.h"
+
+// ============================================================================
+// Boundary Condition Types
+// ============================================================================
+
+typedef enum {
     BC_DIRICHLET,    // Fixed value: u(boundary) = g(x,y,z,t)
     BC_NEUMANN,      // Fixed derivative: ∂u/∂n = h(x,y,z,t)
     BC_ROBIN,        // Mixed: α*u + β*∂u/∂n = f(x,y,z,t)
@@ -79,6 +220,11 @@ typedef struct GridMetadata {
     
     int n_dims;             // Number of dimensions
     int refcount;           // Reference count for memory management
+    
+    // Performance optimization: pre-computed strides for linear-to-index conversion
+    // strides[i] = dims[i+1] * dims[i+2] * ... * dims[n-1]
+    // Eliminates repeated multiplication in grid_linear_to_index (32.86% bottleneck)
+    uint32_t *strides;      // Cumulative strides for index conversion
 } GridMetadata;
 
 // Create uniform grid
@@ -93,6 +239,9 @@ GridMetadata* grid_metadata_create(const uint32_t *dims,
 
 // Free grid metadata
 void grid_metadata_free(GridMetadata *grid);
+
+// Retain/increment reference count for GridMetadata
+void grid_metadata_retain(GridMetadata *grid);
 
 // Get total number of grid points
 uint32_t grid_get_total_points(const GridMetadata *grid);
@@ -215,6 +364,87 @@ GridField* grid_field_scale(const GridField *field, double scalar);
 
 // Compute L2 norm: ||field||₂ = sqrt(Σ field[i]²)
 double grid_field_norm(const GridField *field);
+
+// Copy grid field
+GridField* grid_field_copy(const GridField *field);
+
+// ============================================================================
+// Axis Naming and Grid-Literal Helpers
+// ============================================================================
+
+// Get standard axis name for integer index (0='x', 1='y', 2='z', 3='w', 4='r', ...)
+// Returns pointer to static string, do not free
+const char* grid_axis_name(int axis);
+
+// Get axis index from name ('x'->0, 'y'->1, 'z'->2, 'w'->3, 'r'->4, ...)
+// Returns -1 if name not recognized
+int grid_axis_from_name(const char *name);
+
+// Check if a Literal's shape matches a grid's dimensions
+bool grid_literal_matches(const Literal *lit, const GridMetadata *grid);
+
+// Wrap a Literal as a temporary GridField (shallow copy of data)
+// Caller must free the returned GridField with grid_field_free()
+GridField* grid_field_wrap_literal(Literal *lit, GridMetadata *grid);
+
+// ============================================================================
+// Boundary Condition Configuration
+// ============================================================================
+
+// Set edge boundary condition with constant value
+// grid: Grid metadata (must not be NULL)
+// axis: Dimension index (0=x, 1=y, 2=z)
+// side: 0 for minimum face, 1 for maximum face
+// type: Boundary condition type
+// value: Constant value (for Dirichlet/Neumann) or reflection coefficient
+void grid_set_boundary(GridMetadata *grid, int axis, int side, 
+                       BoundaryType type, double value);
+
+// Set edge boundary condition with function
+// grid: Grid metadata (must not be NULL)
+// axis: Dimension index (0=x, 1=y, 2=z)
+// side: 0 for minimum face, 1 for maximum face
+// type: Boundary condition type (BC_DIRICHLET or BC_NEUMANN)
+// func: Function to evaluate boundary value
+void grid_set_boundary_func(GridMetadata *grid, int axis, int side,
+                            BoundaryType type, BCFunction func);
+
+// Set Robin boundary condition: α*u + β*∂u/∂n = γ
+void grid_set_robin_boundary(GridMetadata *grid, int axis, int side,
+                             double alpha, double beta, double gamma);
+
+// Set open boundary with specific Taylor series extrapolation order
+// grid: Grid metadata (must not be NULL)
+// axis: Dimension index (0=x, 1=y, 2=z)
+// side: 0 for minimum face, 1 for maximum face
+// order: Maximum order of Taylor series (1 or higher, limited by available grid points)
+void grid_set_open_boundary(GridMetadata *grid, int axis, int side, int order);
+
+// Add arbitrary bounded hyperplane boundary
+// Returns: Index of added boundary, or -1 on error
+int grid_add_hyperplane_boundary(GridMetadata *grid,
+                                 const double *normal,
+                                 const double *point,
+                                 const double *bounds_min,
+                                 const double *bounds_max,
+                                 BoundaryType type,
+                                 double value);
+
+// Add arbitrary bounded hyperplane with function
+int grid_add_hyperplane_boundary_func(GridMetadata *grid,
+                                      const double *normal,
+                                      const double *point,
+                                      const double *bounds_min,
+                                      const double *bounds_max,
+                                      BoundaryType type,
+                                      BCFunction func);
+
+// Check if a point is near a hyperplane boundary
+// Returns: boundary index + 1 if near a boundary, 0 if interior
+int grid_point_near_boundary(const GridMetadata *grid, const double *coords);
+
+// Update time parameter for time-dependent BCs
+void grid_update_bc_time(GridMetadata *grid, double t);
 
 // Copy grid field
 GridField* grid_field_copy(const GridField *field);
