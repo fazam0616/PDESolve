@@ -93,36 +93,104 @@ static void draw_fullscreen_quad(void) {
     glEnd();
 }
 
+/* Centralized expression emitter.
+   `coord` should be "uv" or "c" depending on which sampling coordinate
+   the caller wants the emitted GLSL to use. Returns a malloc'd string that
+   the caller must free. */
+static char* emit_expr_common(Expression *e, const char *coord) {
+    if (!e) return strdup("0.0");
+    if (e->type == EXPR_LITERAL) {
+        double v = e->data.literal->field ? e->data.literal->field[0] : 0.0;
+        char *s = malloc(64);
+        snprintf(s,64, "%g", v);
+        return s;
+    } else if (e->type == EXPR_VARIABLE) {
+        const char *name = e->data.variable;
+        char *s = malloc(64);
+        snprintf(s,64, "texture2D(%s_tex, %s).r", name, coord);
+        return s;
+    } else if (e->type == EXPR_UNARY) {
+        if (e->data.unary.op == OP_DERIVATIVE) {
+            Expression *op = e->data.unary.operand;
+            const char *axis = e->data.unary.with_respect_to ? e->data.unary.with_respect_to : "x";
+            if (op && op->type == EXPR_VARIABLE) {
+                const char *name = op->data.variable;
+                char *out = malloc(512);
+                if (strcmp(axis, "x") == 0 || strcmp(axis, "i") == 0) {
+                    snprintf(out,512,"(texture2D(%s_tex, %s + vec2(1.0/float(dims.x),0)).r - texture2D(%s_tex, %s - vec2(1.0/float(dims.x),0)).r) / (2.0 * spacing.x)", name, coord, name, coord);
+                } else {
+                    snprintf(out,512,"(texture2D(%s_tex, %s + vec2(0,1.0/float(dims.y))).r - texture2D(%s_tex, %s - vec2(0,1.0/float(dims.y))).r) / (2.0 * spacing.y)", name, coord, name, coord);
+                }
+                return out;
+            }
+        } else if (e->data.unary.op == OP_LAPLACIAN) {
+            Expression *op = e->data.unary.operand;
+            if (op && op->type == EXPR_VARIABLE) {
+                const char *name = op->data.variable;
+                char *out = malloc(1024);
+                snprintf(out,1024,
+                    "( (texture2D(%s_tex, %s + vec2(1.0/float(dims.x),0)).r - 2.0*texture2D(%s_tex, %s).r + texture2D(%s_tex, %s - vec2(1.0/float(dims.x),0)).r) / (spacing.x*spacing.x) ) + "
+                    "( (texture2D(%s_tex, %s + vec2(0,1.0/float(dims.y))).r - 2.0*texture2D(%s_tex, %s).r + texture2D(%s_tex, %s - vec2(0,1.0/float(dims.y))).r) / (spacing.y*spacing.y) )",
+                    name, coord, name, coord, name, coord,
+                    name, coord, name, coord, name, coord);
+                return out;
+            }
+        } else if (e->data.unary.op == OP_NEGATE) {
+            char *sub = emit_expr_common(e->data.unary.operand, coord);
+            size_t need = strlen(sub) + 8; /* allow for (-() ) and NUL */
+            char *out = malloc(need);
+            if (out) snprintf(out, need, "(-(%s))", sub);
+            free(sub);
+            return out;
+        }
+    } else if (e->type == EXPR_BINARY) {
+        char *L = emit_expr_common(e->data.binary.left, coord);
+        char *R = emit_expr_common(e->data.binary.right, coord);
+        size_t need = strlen(L) + strlen(R) + 64;
+        char *out = malloc(need);
+        if (out) {
+            if (e->data.binary.op == OP_ADD) snprintf(out, need, "((%s) + (%s))", L, R);
+            else if (e->data.binary.op == OP_MULTIPLY) snprintf(out, need, "((%s) * (%s))", L, R);
+            else if (e->data.binary.op == OP_POW) snprintf(out, need, "pow((%s), (%s))", L, R);
+            else if (e->data.binary.op == OP_MIN) snprintf(out, need, "min((%s), (%s))", L, R);
+            else if (e->data.binary.op == OP_MAX) snprintf(out, need, "max((%s), (%s))", L, R);
+            else snprintf(out, need, "(0.0)");
+        }
+        free(L); free(R);
+        return out;
+    }
+    return strdup("0.0");
+}
+
+/* Collect variable names referenced by an expression into `vars`/`nvars`.
+   Caller must initialize *vars and *nvars appropriately (NULL/0). */
+static void collect_expr_vars(Expression *e, char ***vars, int *nvars) {
+    if (!e) return;
+    if (e->type == EXPR_VARIABLE) {
+        const char *name = e->data.variable;
+        int found = 0;
+        for (int i = 0; i < *nvars; ++i) if (strcmp((*vars)[i], name) == 0) { found = 1; break; }
+        if (!found) {
+            *vars = realloc(*vars, sizeof(char*)*((*nvars)+1));
+            (*vars)[(*nvars)++] = strdup(name);
+        }
+    } else if (e->type == EXPR_UNARY) {
+        collect_expr_vars(e->data.unary.operand, vars, nvars);
+    } else if (e->type == EXPR_BINARY) {
+        collect_expr_vars(e->data.binary.left, vars, nvars);
+        collect_expr_vars(e->data.binary.right, vars, nvars);
+    }
+}
+
 // Emit a fragment shader for a + 2*b like expressions. For now support:
 // - variables: single-letter names mapped to sampler2D uniforms (a,b,c,...)
 // - binary ops: add, multiply
 // - scalar literals (double -> float constant)
 // This is intentionally small to match current tests.
 static char* emit_glsl_for_expr(Expression *expr, GridMetadata *grid, char ***out_var_list, int *out_nvars) {
-    // Collect variable names by simple traversal (support variables only)
+    // Collect variable names referenced by `expr`
     char **vars = NULL; int nvars = 0;
-    // helper
-    void collect(Expression *e) {
-        if (!e) return;
-        if (e->type == EXPR_VARIABLE) {
-            const char *name = e->data.variable;
-            // add if missing
-            int found = 0;
-            for (int i=0;i<nvars;i++) if (strcmp(vars[i], name)==0) { found=1; break; }
-            if (!found) {
-                vars = realloc(vars, sizeof(char*)*(nvars+1));
-                vars[nvars++] = strdup(name);
-            }
-        } else if (e->type == EXPR_UNARY) {
-            collect(e->data.unary.operand);
-        } else if (e->type == EXPR_BINARY) {
-            collect(e->data.binary.left);
-            collect(e->data.binary.right);
-        } else if (e->type == EXPR_LITERAL) {
-            // nothing
-        }
-    }
-    collect(expr);
+    collect_expr_vars(expr, &vars, &nvars);
 
     // Build GLSL
     const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
@@ -150,72 +218,7 @@ static char* emit_glsl_for_expr(Expression *expr, GridMetadata *grid, char ***ou
      strncat(fs, "uniform int use_mask;\n", buf- strlen(fs)-1);
     strncat(fs, "void main() { vec2 uv = gl_TexCoord[0].st; uv = (floor(uv * vec2(dims)) + vec2(0.5)) / vec2(dims); float result = 0.0;\n", buf- strlen(fs)-1);
 
-    // function to emit expression recursively
-    char expr_buf[4096];
-    expr_buf[0] = '\0';
-    // return a string fragment representing expression
-    char* emit_expr(Expression *e) {
-        if (!e) return strdup("0.0");
-        if (e->type == EXPR_LITERAL) {
-            double v = e->data.literal->field ? e->data.literal->field[0] : 0.0;
-            char *s = malloc(64);
-            snprintf(s,64, "%g", v);
-            return s;
-        } else if (e->type == EXPR_VARIABLE) {
-            const char *name = e->data.variable;
-            char *s = malloc(64);
-            snprintf(s,64, "texture2D(%s_tex, uv).r", name);
-            return s;
-        } else if (e->type == EXPR_UNARY) {
-            if (e->data.unary.op == OP_DERIVATIVE) {
-                Expression *op = e->data.unary.operand;
-                const char *axis = e->data.unary.with_respect_to ? e->data.unary.with_respect_to : "x";
-                if (op && op->type == EXPR_VARIABLE) {
-                    const char *name = op->data.variable;
-                    char *out = malloc(512);
-                    if (strcmp(axis, "x") == 0 || strcmp(axis, "i") == 0) {
-                        snprintf(out,512,"(texture2D(%s_tex, uv + vec2(1.0/float(dims.x),0)).r - texture2D(%s_tex, uv - vec2(1.0/float(dims.x),0)).r) / (2.0 * spacing.x)", name, name);
-                    } else {
-                        snprintf(out,512,"(texture2D(%s_tex, uv + vec2(0,1.0/float(dims.y))).r - texture2D(%s_tex, uv - vec2(0,1.0/float(dims.y))).r) / (2.0 * spacing.y)", name, name);
-                    }
-                    return out;
-                }
-            } else if (e->data.unary.op == OP_LAPLACIAN) {
-                Expression *op = e->data.unary.operand;
-                if (op && op->type == EXPR_VARIABLE) {
-                    const char *name = op->data.variable;
-                    char *out = malloc(1024);
-                    snprintf(out,1024,
-                        "( (texture2D(%s_tex, uv + vec2(1.0/float(dims.x),0)).r - 2.0*texture2D(%s_tex, uv).r + texture2D(%s_tex, uv - vec2(1.0/float(dims.x),0)).r) / (spacing.x*spacing.x) ) + "
-                        "( (texture2D(%s_tex, uv + vec2(0,1.0/float(dims.y))).r - 2.0*texture2D(%s_tex, uv).r + texture2D(%s_tex, uv - vec2(0,1.0/float(dims.y))).r) / (spacing.y*spacing.y) )",
-                        name, name, name, name, name, name);
-                    return out;
-                }
-            } else if (e->data.unary.op == OP_NEGATE) {
-                char *sub = emit_expr(e->data.unary.operand);
-                size_t need = strlen(sub) + 8; /* allow for (-() ) and NUL */
-                char *out = malloc(need);
-                if (out) snprintf(out, need, "(-(%s))", sub);
-                free(sub);
-                return out;
-            }
-        } else if (e->type == EXPR_BINARY) {
-            char *L = emit_expr(e->data.binary.left);
-            char *R = emit_expr(e->data.binary.right);
-            size_t need = strlen(L) + strlen(R) + 64;
-            char *out = malloc(need);
-            if (out) {
-                if (e->data.binary.op == OP_ADD) snprintf(out, need, "((%s) + (%s))", L, R);
-                else if (e->data.binary.op == OP_MULTIPLY) snprintf(out, need, "((%s) * (%s))", L, R);
-                else snprintf(out, need, "(0.0)");
-            }
-            free(L); free(R);
-            return out;
-        }
-        return strdup("0.0");
-    }
-
-    char *body = emit_expr(expr);
+    char *body = emit_expr_common(expr, "uv");
     strncat(fs, " result = ", buf- strlen(fs)-1);
     strncat(fs, body, buf- strlen(fs)-1);
     free(body);
@@ -233,6 +236,105 @@ static char* emit_glsl_for_expr(Expression *expr, GridMetadata *grid, char ***ou
     return full;
 }
 
+/* Emit GLSL fragment source for an array of render-mode definitions. The
+   resulting shader exposes an `int render_mode` uniform and computes a
+   vec3 rgb value depending on the selected mode. Variables referenced in
+   any of the channel expressions will be collected and declared as
+   sampler2D uniforms named <var>_tex. */
+static char* emit_glsl_for_render_modes(RenderModeDef *modes, int n_modes, GridMetadata *grid, char ***out_var_list, int *out_nvars) {
+    if (!modes || n_modes <= 0) return NULL;
+    // collect variables across all expressions
+    char **vars = NULL; int nvars = 0;
+    void collect(Expression *e) {
+        if (!e) return;
+        if (e->type == EXPR_VARIABLE) {
+            const char *name = e->data.variable;
+            int found = 0; for (int i=0;i<nvars;i++) if (strcmp(vars[i], name) == 0) { found = 1; break; }
+            if (!found) { vars = realloc(vars, sizeof(char*)*(nvars+1)); vars[nvars++] = strdup(name); }
+        } else if (e->type == EXPR_UNARY) {
+            collect(e->data.unary.operand);
+        } else if (e->type == EXPR_BINARY) {
+            collect(e->data.binary.left); collect(e->data.binary.right);
+        }
+    }
+    for (int m=0;m<n_modes;m++) for (int c=0;c<3;c++) collect(modes[m].chan_expr[c]);
+
+    size_t buf = 16384;
+    char *fs = calloc(1, buf);
+    strncat(fs, "#version 120\n", buf - strlen(fs) - 1);
+    // declare sampler uniforms for each collected variable
+    for (int i=0;i<nvars;i++) {
+        char line[128]; snprintf(line, sizeof(line), "uniform sampler2D %s_tex;\n", vars[i]);
+        strncat(fs, line, buf - strlen(fs) -1);
+    }
+    // grid and mask uniforms
+    strncat(fs, "uniform ivec2 dims;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform vec2 spacing;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform sampler2D mask_tex;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform sampler2D val_tex;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform int use_mask;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform int render_mode;\n", buf - strlen(fs) -1);
+    strncat(fs, "uniform float value_scale;\n", buf - strlen(fs) -1);
+     /* viewport mapping: provide visible offset and size so caller can render a
+         centered sub-rectangle of the simulation domain rather than always
+         sampling the full grid. */
+     strncat(fs, "uniform ivec2 vis_offset;\n", buf - strlen(fs) -1);
+     strncat(fs, "uniform ivec2 vis_size;\n", buf - strlen(fs) -1);
+     /* main header uses vis_offset/vis_size to compute texel sampling coords */
+     strncat(fs, "void main() { vec2 uv = gl_TexCoord[0].st; vec2 tex_idx = vec2(vis_offset) + uv * vec2(vis_size); vec2 c = (floor(tex_idx) + vec2(0.5)) / vec2(dims); vec3 rgb = vec3(0.0);\n", buf - strlen(fs) -1);
+
+    /* use centralized emitter with sampling coordinate 'c' */
+
+    // Emit if/else chain for each mode (avoid GLSL 'switch' compatibility issues)
+    for (int m=0;m<n_modes;m++) {
+        char hdr[128];
+        if (m == 0) snprintf(hdr, sizeof(hdr), "if (render_mode == %d) {\n", m);
+        else snprintf(hdr, sizeof(hdr), "else if (render_mode == %d) {\n", m);
+        strncat(fs, hdr, buf - strlen(fs) -1);
+        /* compute each channel expression; if NULL, use 0.0. Apply per-mode
+           per-channel compile-time scaling and optional sqrt() as requested
+           via the RenderModeDef fields. */
+        for (int c=0;c<3;c++) {
+            Expression *e = modes[m].chan_expr[c];
+            if (!e) {
+                char line[64]; snprintf(line, sizeof(line), "  float ch%d = 0.0;\n", c); strncat(fs, line, buf - strlen(fs) -1);
+            } else {
+                char *es = emit_expr_common(e, "c");
+                char line[1024];
+                double scale = 1.0;
+                int apply_sqrt = 0;
+                /* read optional fields if present in the struct (default values used otherwise) */
+                scale = modes[m].chan_scale[c];
+                apply_sqrt = modes[m].chan_apply_sqrt[c];
+                if (scale == 1.0 && !apply_sqrt) {
+                    snprintf(line, sizeof(line), "  float ch%d = (%s);\n", c, es);
+                } else if (scale == 1.0 && apply_sqrt) {
+                    snprintf(line, sizeof(line), "  float ch%d = sqrt(max(0.0, (%s)));\n", c, es);
+                } else if (scale != 1.0 && !apply_sqrt) {
+                    snprintf(line, sizeof(line), "  float ch%d = (%s) * %g;\n", c, es, scale);
+                } else {
+                    snprintf(line, sizeof(line), "  float ch%d = sqrt(max(0.0, (%s))) * %g;\n", c, es, scale);
+                }
+                strncat(fs, line, buf - strlen(fs) -1);
+                free(es);
+            }
+        }
+        strncat(fs, "  rgb = vec3(ch0, ch1, ch2); }\n", buf - strlen(fs) -1);
+    }
+    /* default fallback */
+    strncat(fs, "else { rgb = vec3(0.0); }\n", buf - strlen(fs) -1);
+
+    // apply boundary mask override if needed (sample mask/val at computed texel coord 'c')
+    strncat(fs, "if (use_mask != 0) { float m = texture2D(mask_tex, c).r; if (m > 0.5) { float v = texture2D(val_tex, c).r; rgb = vec3(v,0.0,0.0); } }\n", buf - strlen(fs) -1);
+
+    /* apply runtime value_scale to all channels (value_scale provided by caller) */
+    strncat(fs, "rgb = rgb * value_scale;\n", buf - strlen(fs) -1);
+    strncat(fs, "gl_FragColor = vec4(rgb, 1.0); }\n", buf - strlen(fs) -1);
+
+    *out_var_list = vars; *out_nvars = nvars;
+    return fs;
+}
+
 GPUProgram* gpu_compile_expression(Expression *expr, GridMetadata *grid, GPUBackend backend) {
     if (!expr || !grid) return NULL;
     GPUProgram *p = calloc(1, sizeof(GPUProgram));
@@ -243,6 +345,12 @@ GPUProgram* gpu_compile_expression(Expression *expr, GridMetadata *grid, GPUBack
 
     ShaderKernel *k = calloc(1, sizeof(ShaderKernel));
     k->root = expr; // keep pointer for codegen
+    if (expr) {
+        k->owned_exprs = calloc(1, sizeof(Expression*));
+        k->owned_exprs[0] = expr;
+        k->n_owned_exprs = 1;
+        expression_retain(expr);
+    }
 
     // Emit GLSL fragment for this expression
     char **var_list = NULL; int nvars = 0;
@@ -269,11 +377,66 @@ GPUProgram* gpu_compile_optimized(Expression *expr, GridMetadata *grid, GPUBacke
     return gpu_compile_expression(expr, grid, backend);
 }
 
+GPUProgram* gpu_compile_render_modes(RenderModeDef *modes, int n_modes, GridMetadata *grid, GPUBackend backend) {
+    if (!modes || n_modes <= 0 || !grid) return NULL;
+    GPUProgram *p = calloc(1, sizeof(GPUProgram));
+    p->grid = grid; p->backend = backend; p->n_kernels = 1; p->kernels = calloc(1, sizeof(ShaderKernel*));
+    ShaderKernel *k = calloc(1, sizeof(ShaderKernel));
+    k->root = NULL; // no single root
+
+    // Emit GLSL for all render modes
+    char **var_list = NULL; int nvars = 0;
+    char *fs_src = emit_glsl_for_render_modes(modes, n_modes, grid, &var_list, &nvars);
+    if (!fs_src) { free(k); free(p); return NULL; }
+    k->source = fs_src;
+    k->n_inputs = nvars;
+    if (nvars > 0) {
+        k->inputs = calloc(nvars, sizeof(char*));
+        for (int i=0;i<nvars;i++) k->inputs[i] = strdup(var_list[i]);
+    } else k->inputs = NULL;
+    k->n_var_names = nvars;
+    if (nvars > 0) { k->var_names = calloc(nvars, sizeof(char*)); for (int i=0;i<nvars;i++) k->var_names[i] = strdup(k->inputs[i]); }
+
+    /* Retain any expressions referenced by RenderModeDef so that the program
+       owns them and can free on program destruction. We will collect unique
+       expressions across all modes and retain them here. */
+    // Count expressions
+    int expr_count = 0;
+    for (int m=0;m<n_modes;m++) for (int c=0;c<3;c++) if (modes[m].chan_expr[c]) expr_count++;
+    if (expr_count > 0) {
+        k->owned_exprs = calloc(expr_count, sizeof(Expression*));
+        int idx = 0;
+        for (int m=0;m<n_modes;m++) for (int c=0;c<3;c++) {
+            Expression *e = modes[m].chan_expr[c];
+            if (!e) continue;
+            // avoid duplicates: simple linear search
+            int found = 0;
+            for (int j=0;j<idx;j++) if (k->owned_exprs[j] == e) { found = 1; break; }
+            if (!found) { k->owned_exprs[idx++] = e; expression_retain(e); }
+        }
+        k->n_owned_exprs = idx;
+    } else {
+        k->owned_exprs = NULL; k->n_owned_exprs = 0;
+    }
+
+    p->kernels[0] = k; p->fused = true; p->boundary_mask = NULL;
+    // free temporary var_list
+    if (var_list) { for (int i=0;i<nvars;i++) if (var_list[i]) free(var_list[i]); free(var_list); }
+    return p;
+}
+
 void gpu_program_free(GPUProgram *prog) {
     if (!prog) return;
     for (int i = 0; i < prog->n_kernels; ++i) {
         ShaderKernel *k = prog->kernels[i];
         if (!k) continue;
+        if (k->owned_exprs) {
+            for (int e = 0; e < k->n_owned_exprs; ++e) {
+                if (k->owned_exprs[e]) expression_release(k->owned_exprs[e]);
+            }
+            free(k->owned_exprs);
+            k->owned_exprs = NULL; k->n_owned_exprs = 0;
+        }
         if (k->source) free(k->source);
         if (k->inputs) {
             for (int j = 0; j < k->n_inputs; ++j) if (k->inputs[j]) free(k->inputs[j]);

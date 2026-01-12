@@ -20,6 +20,10 @@ typedef struct {
     int compute_intensity;
     /* optional CPU-side expression root for test execution */
     Expression *root;
+    /* Expressions owned/retained by this kernel (compiler retains refs)
+       The GPUProgram is responsible for releasing these when freed. */
+    Expression **owned_exprs;
+    int n_owned_exprs;
     char **var_names;
     int n_var_names;
     /* GL runtime handles (set when compiled/executed on GL context) */
@@ -46,6 +50,37 @@ typedef struct {
 } GPUProgram;
 
 typedef struct GPUContext GPUContext;
+
+/* Definition of a render-mode: for each UI render index this struct contains
+    up to three expressions (R,G,B) that should be evaluated by the emitted
+    fragment shader when that render mode is active. The compiler will fuse
+    all modes into a single monolithic shader that branches on a
+    `render_mode` uniform at runtime. */
+typedef struct {
+     char *name; /* optional name for the mode (debug/labels) */
+     Expression *chan_expr[3]; /* expressions for R, G, B channels (may be NULL)
+                                          each evaluated in the shader when this mode is selected */
+      /* Per-channel compile-time scale applied in addition to runtime `value_scale`.
+          Use values < 1.0 to avoid saturating color ranges by default. */
+      double chan_scale[3];
+      /* Per-channel flag: after computing the channel expression, apply sqrt()
+          to the channel value (useful for magnitude-of-square expressions). */
+      int chan_apply_sqrt[3];
+     /* Optional list of grid names that these expressions reference. This
+         is informational for callers; the compiler discovers variable names
+         automatically from expressions but callers can provide explicit
+         grid bindings here if desired. Strings are owned by the caller. */
+     char **grid_names;
+     int n_grid_names;
+} RenderModeDef;
+
+/* Compile a set of render mode definitions into a single GPUProgram. The
+    generated fragment shader will declare a uniform `int render_mode` and
+    evaluate the corresponding channel expressions to fill the RGB channels.
+    The returned GPUProgram follows the same runtime expectations as
+    gpu_compile_expression (sampler uniforms named <var>_tex for variables
+    referenced in the expressions). */
+GPUProgram* gpu_compile_render_modes(RenderModeDef *modes, int n_modes, GridMetadata *grid, GPUBackend backend);
 
 GPUProgram* gpu_compile_expression(Expression *expr, GridMetadata *grid, GPUBackend backend);
 GPUProgram* gpu_compile_optimized(Expression *expr, GridMetadata *grid, GPUBackend backend);

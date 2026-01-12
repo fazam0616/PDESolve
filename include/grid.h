@@ -107,6 +107,9 @@ GridField* grid_field_add(const GridField *a, const GridField *b);
 GridField* grid_field_multiply(const GridField *a, const GridField *b);
 GridField* grid_field_scale(const GridField *field, double scalar);
 void grid_field_scale_inplace(GridField *field, double scalar);
+// Apply element-wise exponentiation in-place: field = field ^ exponent_literal
+// exponent_literal may be a scalar (broadcast) or same-shaped literal. Returns 0 on success.
+int grid_field_exponent_inplace(GridField *field, const Literal *exponent_literal);
 int grid_field_axpy(GridField *y, double a, const GridField *x);
 int grid_field_pointwise_multiply_into(const GridField *a, const GridField *b, GridField *out);
 int grid_field_copy_into(const GridField *src, GridField *dst);

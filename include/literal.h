@@ -128,6 +128,10 @@ Literal* literal_negate(Literal *lit);
 Literal* literal_matmul(Literal *left, Literal *right);
 Literal* literal_dot(Literal *left, Literal *right);
 Literal* literal_transpose(Literal *lit, bool *success);
+// Element-wise pow/min/max with broadcasting support
+Literal* literal_pow(Literal *base, Literal *exponent);
+Literal* literal_min(Literal *a, Literal *b);
+Literal* literal_max(Literal *a, Literal *b);
 
 // Broadcast a literal to a target shape (returns new literal, caller must free)
 // Returns NULL if broadcasting is not possible

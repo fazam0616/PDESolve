@@ -821,6 +821,89 @@ Literal* literal_multiply(Literal *left, Literal *right) {
     return result;
 }
 
+// Element-wise power with broadcasting: base ^ exponent
+Literal* literal_pow(Literal *base, Literal *exponent) {
+    if (!base || !exponent) return NULL;
+    // Determine broadcasted shape
+    uint32_t target_shape[N_DIM];
+    for (int i = 0; i < N_DIM; i++) {
+        if (base->shape[i] == exponent->shape[i]) target_shape[i] = base->shape[i];
+        else if (base->shape[i] == 1) target_shape[i] = exponent->shape[i];
+        else if (exponent->shape[i] == 1) target_shape[i] = base->shape[i];
+        else return NULL;
+    }
+    size_t total = 1; for (int i=0;i<N_DIM;i++) total *= target_shape[i];
+    Literal *result = literal_create(target_shape);
+    if (!result) return NULL;
+    // Fast path identical
+    bool identical = true; for (int i=0;i<N_DIM;i++) if (base->shape[i] != exponent->shape[i]) { identical = false; break; }
+    if (identical && base->field && exponent->field) {
+        for (size_t i=0;i<total;i++) result->field[i] = pow(base->field[i], exponent->field[i]);
+        return result;
+    }
+    // General broadcasted loop
+    size_t bstr[N_DIM], estr[N_DIM]; compute_strides(base->shape, bstr); compute_strides(exponent->shape, estr);
+    uint32_t counters[N_DIM]; for (int d=0; d<N_DIM; d++) counters[d]=0;
+    for (size_t flat=0; flat<total; flat++) {
+        size_t boff=0, eoff=0;
+        for (int d=0; d<N_DIM; d++) {
+            if (base->shape[d] != 1) boff += (size_t)counters[d] * bstr[d];
+            if (exponent->shape[d] != 1) eoff += (size_t)counters[d] * estr[d];
+        }
+        double a = base->field ? base->field[boff] : 0.0;
+        double b = exponent->field ? exponent->field[eoff] : 0.0;
+        result->field[flat] = pow(a, b);
+        for (int d=N_DIM-1; d>=0; d--) { counters[d]++; if (counters[d] < target_shape[d]) break; counters[d]=0; }
+    }
+    return result;
+}
+
+Literal* literal_min(Literal *a, Literal *b) {
+    if (!a || !b) return NULL;
+    uint32_t target_shape[N_DIM];
+    for (int i = 0; i < N_DIM; i++) {
+        if (a->shape[i] == b->shape[i]) target_shape[i] = a->shape[i];
+        else if (a->shape[i] == 1) target_shape[i] = b->shape[i];
+        else if (b->shape[i] == 1) target_shape[i] = a->shape[i];
+        else return NULL;
+    }
+    size_t total = 1; for (int i=0;i<N_DIM;i++) total *= target_shape[i];
+    Literal *result = literal_create(target_shape); if (!result) return NULL;
+    size_t astr[N_DIM], bstr[N_DIM]; compute_strides(a->shape, astr); compute_strides(b->shape, bstr);
+    uint32_t counters[N_DIM]; for (int d=0; d<N_DIM; d++) counters[d]=0;
+    for (size_t flat=0; flat<total; flat++) {
+        size_t aoff=0, boff=0;
+        for (int d=0; d<N_DIM; d++) { if (a->shape[d] != 1) aoff += (size_t)counters[d] * astr[d]; if (b->shape[d] != 1) boff += (size_t)counters[d] * bstr[d]; }
+        double av = a->field ? a->field[aoff] : 0.0; double bv = b->field ? b->field[boff] : 0.0;
+        result->field[flat] = av < bv ? av : bv;
+        for (int d=N_DIM-1; d>=0; d--) { counters[d]++; if (counters[d] < target_shape[d]) break; counters[d]=0; }
+    }
+    return result;
+}
+
+Literal* literal_max(Literal *a, Literal *b) {
+    if (!a || !b) return NULL;
+    uint32_t target_shape[N_DIM];
+    for (int i = 0; i < N_DIM; i++) {
+        if (a->shape[i] == b->shape[i]) target_shape[i] = a->shape[i];
+        else if (a->shape[i] == 1) target_shape[i] = b->shape[i];
+        else if (b->shape[i] == 1) target_shape[i] = a->shape[i];
+        else return NULL;
+    }
+    size_t total = 1; for (int i=0;i<N_DIM;i++) total *= target_shape[i];
+    Literal *result = literal_create(target_shape); if (!result) return NULL;
+    size_t astr[N_DIM], bstr[N_DIM]; compute_strides(a->shape, astr); compute_strides(b->shape, bstr);
+    uint32_t counters[N_DIM]; for (int d=0; d<N_DIM; d++) counters[d]=0;
+    for (size_t flat=0; flat<total; flat++) {
+        size_t aoff=0, boff=0;
+        for (int d=0; d<N_DIM; d++) { if (a->shape[d] != 1) aoff += (size_t)counters[d] * astr[d]; if (b->shape[d] != 1) boff += (size_t)counters[d] * bstr[d]; }
+        double av = a->field ? a->field[aoff] : 0.0; double bv = b->field ? b->field[boff] : 0.0;
+        result->field[flat] = av > bv ? av : bv;
+        for (int d=N_DIM-1; d>=0; d--) { counters[d]++; if (counters[d] < target_shape[d]) break; counters[d]=0; }
+    }
+    return result;
+}
+
 // Scale all elements
 Literal* literal_scale(Literal *lit, double scalar) {
     if (!lit) return NULL;

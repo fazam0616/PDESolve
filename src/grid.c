@@ -1487,6 +1487,24 @@ GridField* grid_field_wrap_literal(Literal *lit, GridMetadata *grid) {
     return field;
 }
 
+int grid_field_exponent_inplace(GridField *field, const Literal *exponent_literal) {
+    if (!field || !exponent_literal) return -1;
+    // Copy base and exponent to pass to literal_pow (which expects mutable pointers)
+    Literal *base = literal_copy(&field->data);
+    if (!base) return -1;
+    Literal *exp_copy = literal_copy((Literal*)exponent_literal);
+    if (!exp_copy) { literal_free(base); return -1; }
+    Literal *res = literal_pow(base, exp_copy);
+    literal_free(base); literal_free(exp_copy);
+    if (!res) return -1;
+    // Replace field->data with res (steal data pointer)
+    if (field->data.field) free(field->data.field);
+    field->data.field = res->field;
+    for (int i = 0; i < N_DIM; i++) field->data.shape[i] = res->shape[i];
+    free(res);
+    return 0;
+}
+
 // ============================================================================
 // Boundary Condition Configuration
 // ============================================================================

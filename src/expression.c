@@ -101,6 +101,8 @@ Expression* expr_derivative(Expression *operand, const char *var) {
     expr->data.unary.operand = operand;
     expr->data.unary.with_respect_to = strdup(var);
     expr->_hash_cache = 0;
+    expr->ref_count = 1;
+    expression_retain(operand);
     return expr;
 }
 
@@ -132,6 +134,9 @@ Expression* expr_einsum(Expression *left, const char *left_indices,
     expr->data.binary.index_spec->out_indices = strdup(out_indices ? out_indices : "");
     
     expr->_hash_cache = 0;
+    expr->ref_count = 1;
+    expression_retain(left);
+    expression_retain(right);
     return expr;
 }
 
@@ -140,6 +145,19 @@ Expression *make_scalar(double val) {
     Literal *lit = literal_create_scalar(val);
     Expression *expr = expr_literal(lit);
     return expr;
+}
+
+// Create power expression: base ^ exponent
+Expression* expr_power(Expression *base, Expression *exponent) {
+    return expr_binary(OP_POW, base, exponent);
+}
+
+Expression* expr_min(Expression *left, Expression *right) {
+    return expr_binary(OP_MIN, left, right);
+}
+
+Expression* expr_max(Expression *left, Expression *right) {
+    return expr_binary(OP_MAX, left, right);
 }
 
 // ============================================================================
@@ -353,6 +371,18 @@ Literal* expression_evaluate(Expression *expr, Dictionary *vars) {
             switch (expr->data.binary.op) {
                 case OP_ADD:
                     result = literal_add(left, right);
+                    success = (result != NULL);
+                    break;
+                case OP_POW:
+                    result = literal_pow(left, right);
+                    success = (result != NULL);
+                    break;
+                case OP_MIN:
+                    result = literal_min(left, right);
+                    success = (result != NULL);
+                    break;
+                case OP_MAX:
+                    result = literal_max(left, right);
                     success = (result != NULL);
                     break;
                 case OP_MULTIPLY:

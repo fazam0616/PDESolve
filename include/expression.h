@@ -35,7 +35,10 @@ typedef enum {
     OP_TRANSPOSE,    // Unary: transpose
     OP_DERIVATIVE,   // Unary: ∂f/∂x (symbolic partial derivative)
     OP_LAPLACIAN,    // Unary: ∇²f (Laplacian - sum of second derivatives)
-    OP_EINSUM        // Binary: Einstein summation with explicit indices
+    OP_EINSUM,        // Binary: Einstein summation with explicit indices
+    OP_POW,         // Binary: element-wise power (base ^ exponent)
+    OP_MIN,         // Binary: element-wise min(a,b)
+    OP_MAX,         // Binary: element-wise max(a,b)
 } Operation;
 
 // Unified expression structure
@@ -151,6 +154,13 @@ Expression* expr_laplacian(Expression *operand);
 Expression* expr_einsum(Expression *left, const char *left_indices,
                        Expression *right, const char *right_indices,
                        const char *out_indices);
+
+// Create power expression: base ^ exponent (element-wise / broadcast)
+Expression* expr_power(Expression *base, Expression *exponent);
+
+// Create element-wise min and max expressions
+Expression* expr_min(Expression *left, Expression *right);
+Expression* expr_max(Expression *left, Expression *right);
 
 // Memory management
 

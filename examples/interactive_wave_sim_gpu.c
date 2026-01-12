@@ -148,7 +148,9 @@ typedef struct {
 typedef struct {
     int paused;
     double wave_speed;
+    double dt;
     double max_sim_speed;
+    double steps_per_frame;
     double wave_amplitude;
     double wave_spread;
     double default_source_frequency;
@@ -162,6 +164,7 @@ typedef struct {
     int show_base_menu;
     int show_mouse_controls;
     int show_sim_controls;
+    int limit_fps;
     /* UI-only dummies */
     int dummy_reset;
     int dummy_clear_sources;
@@ -199,6 +202,25 @@ static void cb_deselect_selected_source(VariableInteraction *vi, void *user_data
 static Source *g_sources = NULL;
 static int g_n_sources = 0;
 static int g_selected_source = -1;
+/* GPU-side source descriptor texture and dirty flag (file-scope so callbacks can set it) */
+static GLuint tex_src_desc = 0;
+static int sources_dirty = 1; /* mark true to upload initial data */
+/* Static upload buffer for source descriptors (64 cols x 2 rows x RGBA) */
+static float src_desc_buf[64 * 2 * 4];
+/* Paint buffers/textures moved to file-scope so callbacks (reset) can clear them */
+static float *paint_buf = NULL;
+static GLuint tex_paint = 0;
+static GLuint tex_paint_cpu = 0;
+static int paint_pending = 0;
+static int paint_from_gpu = 0;
+static int paint_buf_dirty = 0;
+/* True when tex_paint_cpu currently holds non-zero CPU paint (so we must clear it on composite) */
+static int paint_cpu_uploaded = 0;
+/* GPU compute timing (measure occasionally with glFinish to avoid constant stalls) */
+static int gpu_time_sample_period = 30; /* measure once every N compute steps */
+static int gpu_time_step_counter = 0;    /* counts compute steps since last sample */
+static double gpu_compute_ms_avg = 0.0;  /* exponential moving average of ms per compute step */
+static int gpu_time_samples = 0;
 
 // Controls mirrored into the source menu for the currently-selected source
 static double sel_src_amp = 0.0;
@@ -217,6 +239,7 @@ static void cb_source_control_changed(VariableInteraction *vi, void *user_data) 
         g_sources[g_selected_source].freq = sel_src_freq;
         g_sources[g_selected_source].phase = sel_src_phase;
         g_sources[g_selected_source].radius = sel_src_radius;
+    sources_dirty = 1;
     }
 }
 
@@ -229,6 +252,7 @@ static void cb_delete_selected_source(VariableInteraction *vi, void *user_data) 
         if (g_n_sources > 0) g_sources = realloc(g_sources, sizeof(Source) * g_n_sources);
         else { free(g_sources); g_sources = NULL; }
         g_selected_source = -1;
+    sources_dirty = 1;
     }
     // clear action button state so menu shows unpressed
     sel_src_delete = 0;
@@ -245,6 +269,7 @@ static void cb_clear_sources(VariableInteraction *vi, void *user_data);
 static void cb_clear_barriers(VariableInteraction *vi, void *user_data);
 // forward-declare wave speed change callback so create_app_menus can reference it
 static void cb_wave_speed_changed(VariableInteraction *vi, void *user_data);
+static void cb_dt_changed(VariableInteraction *vi, void *user_data);
 
 // Data passed to reset callback: hold pointers to the texture variables so
 // the callback re-uploads into the currently-used textures (after ping-pong swaps).
@@ -263,6 +288,7 @@ typedef struct reset_cb_data {
     GridMetadata *grid_ptr;
     double dt_val;
     uint64_t *sim_counter_ptr; /* pointer to simulation step counter so reset can zero it */
+    double *app_wave_speed_ptr; /* pointer to app.wave_speed so dt changes can recompile with current c */
 } reset_cb_data_t;
 static void on_mouse_mode_change(VariableInteraction *vi, void *user_data) {
     if (!vi || !user_data) return;
@@ -359,15 +385,18 @@ static AppMenus *create_app_menus(AppState *app, AppRenderState *render, void *r
     m->sim_menu = menu_create(270,10,250,340,1,"Simulation Controls", textColor, bgColor);
     MenuRow *s1 = menurow_create(); menurow_add_interaction(s1, variableinteraction_create(&app->paused, "Paused", 0, 1, VAR_BOOL, NULL, app)); menu_add_row(m->sim_menu, s1);
     MenuRow *s2 = menurow_create(); menurow_add_interaction(s2, variableinteraction_create(&app->dummy_reset, "Reset", 0, 1, VAR_BOOL, cb_reset, reset_cb_data)); menu_add_row(m->sim_menu, s2);
-    // Wave speed slider: allow values from 0.01 .. 1.0
-    MenuRow *s3 = menurow_create(); menurow_add_interaction(s3, variableinteraction_create(&app->wave_speed, "Wave Speed", 0.01, 2.0, VAR_SLIDER, cb_wave_speed_changed, reset_cb_data)); menu_add_row(m->sim_menu, s3);
-    // Max simulation iterations to run per render (1 .. 50)
-    /* removed steps-per-render slider; simulation will run a fixed number of steps per render (1) */
+    // Wave speed slider: allow values from 0.01 .. 2.0
+    MenuRow *s3 = menurow_create(); menurow_add_interaction(s3, variableinteraction_create(&app->wave_speed, "Wave Speed", 0.01, 4.0, VAR_SLIDER, cb_wave_speed_changed, reset_cb_data)); menu_add_row(m->sim_menu, s3);
+    // Timestep dt slider: very small .. double initial value
+    MenuRow *s4 = menurow_create(); menurow_add_interaction(s4, variableinteraction_create(&app->dt, "dt (s)", 1e-6, fmax(1e-6, 2.0 * ((reset_cb_data_t*)reset_cb_data)->dt_val), VAR_SLIDER, cb_dt_changed, reset_cb_data)); menu_add_row(m->sim_menu, s4);
+    // Number of compute iterations per render (1..10 integer steps)
+    MenuRow *s4b = menurow_create(); menurow_add_interaction(s4b, variableinteraction_create(&app->steps_per_frame, "Steps/frame", 1.0, 10.0, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s4b);
     MenuRow *s5 = menurow_create(); menurow_add_interaction(s5, variableinteraction_create(&render->value_scale, "Scale", 0.001, 10.0, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s5);
     MenuRow *s6 = menurow_create(); menurow_add_interaction(s6, variableinteraction_create(&app->dummy_clear_barriers, "Clear Barriers", 0, 1, VAR_BOOL, cb_clear_barriers, NULL)); menu_add_row(m->sim_menu, s6);
     MenuRow *s7 = menurow_create(); menurow_add_interaction(s7, variableinteraction_create(&app->dummy_clear_sources, "Clear Sources", 0, 1, VAR_BOOL, cb_clear_sources, NULL)); menu_add_row(m->sim_menu, s7);
     MenuRow *s8 = menurow_create(); menurow_add_interaction(s8, variableinteraction_create(&render->show_boundaries, "Show Boundaries", 0, 1, VAR_BOOL, NULL, NULL)); menu_add_row(m->sim_menu, s8);
     MenuRow *s9 = menurow_create(); menurow_add_interaction(s9, variableinteraction_create(&render->show_stats, "Show Stats", 0, 1, VAR_BOOL, NULL, NULL)); menu_add_row(m->sim_menu, s9);
+    MenuRow *s9b = menurow_create(); menurow_add_interaction(s9b, variableinteraction_create(&app->limit_fps, "Limit FPS to ~60", 0, 1, VAR_BOOL, NULL, NULL)); menu_add_row(m->sim_menu, s9b);
     // render mode radio buttons
     MenuRow *s10 = menurow_create(); menurow_add_interaction(s10, variableinteraction_create(&render->mode_height, "Mode: Height", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s10);
     MenuRow *s11 = menurow_create(); menurow_add_interaction(s11, variableinteraction_create(&render->mode_velocity, "Mode: Velocity", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s11);
@@ -429,6 +458,24 @@ static void cb_reset(VariableInteraction *vi, void *user_data) {
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, buf);
     }
 
+    /* Also clear paint buffers/textures so wave additions are reset */
+    {
+        extern float *paint_buf; extern GLuint tex_paint; extern GLuint tex_paint_cpu; extern int paint_buf_dirty; extern int paint_pending; extern int paint_from_gpu;
+        size_t psize = (size_t)d->nx * d->ny * 4 * sizeof(float);
+        if (paint_buf) {
+            memset(paint_buf, 0, psize);
+            paint_buf_dirty = 0;
+            paint_pending = 0; paint_from_gpu = 0;
+            /* upload zeros into paint textures */
+            glBindTexture(GL_TEXTURE_2D, tex_paint);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, paint_buf);
+            glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, paint_buf);
+        }
+    }
+
     free(buf);
     if (vi && vi->variable) *(int*)vi->variable = 0;
     // reset simulation step counter if pointer is provided
@@ -475,8 +522,22 @@ static void cb_wave_speed_changed(VariableInteraction *vi, void *user_data) {
     }
     // store new GPUProgram pointer
     if (d->gpu_prog_ptr) *(d->gpu_prog_ptr) = prog_new;
-    // free the temporary expression
-    expression_free(wave_expr_new);
+    // free the temporary expression (release a ref; GPUProgram retained one)
+    expression_release(wave_expr_new);
+}
+
+/* Callback to handle dt changes from UI: update reset data and recompile compute program. */
+static void cb_dt_changed(VariableInteraction *vi, void *user_data) {
+    if (!user_data || !vi) return;
+    reset_cb_data_t *d = (reset_cb_data_t*)user_data;
+    double new_dt = *(double*)vi->variable;
+    d->dt_val = new_dt;
+    /* Rebuild using current wave speed (call cb_wave_speed_changed with dummy VariableInteraction pointing at wave_speed) */
+    if (d->app_wave_speed_ptr) {
+        VariableInteraction tmp = {0};
+        tmp.variable = d->app_wave_speed_ptr;
+        cb_wave_speed_changed(&tmp, d);
+    }
 }
 
 static void cb_clear_sources(VariableInteraction *vi, void *user_data) {
@@ -584,26 +645,6 @@ int main(int argc, char **argv) {
     if (!ctx) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
     glewExperimental = GL_TRUE; if (glewInit() != GLEW_OK) { fprintf(stderr, "glewInit failed\n"); }
 
-    /* Debug: ensure emitted fragment shader is persisted to disk so we can inspect
-       it even if stderr output is lost or swallowed by the runtime/driver. */
-    if (prog && prog->kernels && prog->kernels[0] && prog->kernels[0]->source) {
-        const char *src = prog->kernels[0]->source;
-        size_t len = strlen(src);
-        fprintf(stderr, "--- emitted fragment shader (len=%zu) ---\n", len);
-        fprintf(stderr, "%s\n--- end emitted fragment shader ---\n", src);
-        fflush(stderr);
-        FILE *f = fopen("/tmp/emitted_fragment_shader.frag", "w");
-        if (f) {
-            fwrite(src, 1, len, f);
-            fclose(f);
-            fprintf(stderr, "Wrote emitted fragment shader to /tmp/emitted_fragment_shader.frag\n");
-            fflush(stderr);
-        } else {
-            fprintf(stderr, "Failed to open /tmp/emitted_fragment_shader.frag for writing\n"); fflush(stderr);
-        }
-    } else {
-        fprintf(stderr, "No emitted fragment shader source available on GPUProgram\n"); fflush(stderr);
-    }
     // Compile compute shader (fragment shader returned by emitter)
     const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
     // Use the emitted compute shader so masking and the wave update are applied
@@ -611,15 +652,14 @@ int main(int argc, char **argv) {
     const char *test_fs = "";
     GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint fs = 0;
-    if (use_test_compute) fs = compile_shader(GL_FRAGMENT_SHADER, test_fs);
-    else fs = compile_shader(GL_FRAGMENT_SHADER, prog->kernels[0]->source);
+    fs = compile_shader(GL_FRAGMENT_SHADER, prog->kernels[0]->source);
     if (!vs || !fs) { fprintf(stderr, "shader compile failed\n"); return 1; }
     GLuint compute_prog = link_program(vs, fs);
     glDeleteShader(vs); glDeleteShader(fs);
     if (!compute_prog) { fprintf(stderr, "link failed\n"); return 1; }
 
-    // Paint composite shader: add paint_tex into src_tex and write to out
-    const char *paint_fs = "#version 120\nuniform sampler2D src_tex; uniform sampler2D paint_tex; void main() { vec2 uv = gl_TexCoord[0].st; float s = texture2D(src_tex, uv).r; float p = texture2D(paint_tex, uv).r; gl_FragColor = vec4(s + p, 0.0, 0.0, 0.0); }";
+    // Paint composite shader: add GPU-generated paint and CPU paint into src_tex and write to out
+    const char *paint_fs = "#version 120\nuniform sampler2D src_tex; uniform sampler2D paint_gpu; uniform sampler2D paint_cpu; void main() { vec2 uv = gl_TexCoord[0].st; float s = texture2D(src_tex, uv).r; float pg = texture2D(paint_gpu, uv).r; float pc = texture2D(paint_cpu, uv).r; gl_FragColor = vec4(s + pg + pc, 0.0, 0.0, 0.0); }";
     GLuint p_fs = compile_shader(GL_FRAGMENT_SHADER, paint_fs);
     GLuint p_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
     GLuint p_prog = link_program(p_vs, p_fs);
@@ -629,20 +669,6 @@ int main(int argc, char **argv) {
     // Prepare initial CPU fields (u_curr with a gaussian source; u_prev zeros)
     double *u_curr_data = calloc((size_t)nx * ny, sizeof(double));
     double *u_prev_data = calloc((size_t)nx * ny, sizeof(double));
-
-    // Place a Gaussian source at the center of the visible domain
-    double src_x = Lx_vis * 0.5; double src_y = Ly_vis * 0.5; double sigma = 0.08; double amp = 0.05; /* much smaller initial bump */
-    /* Place Gaussian centered in the VISIBLE subregion so the sponge rim is around it.
-       We compute coordinates relative to the visible domain origin (offset by 'sponge'). */
-    for (uint32_t j = 0; j < ny; ++j) {
-        for (uint32_t i = 0; i < nx; ++i) {
-            double x = ((double)i - (double)sponge) * spacing[0];
-            double y = ((double)j - (double)sponge) * spacing[1];
-            double dx = x - src_x; double dy = y - src_y; double r2 = dx*dx + dy*dy;
-            u_curr_data[(size_t)i * ny + j] = amp * exp(-r2 / (2.0 * sigma * sigma));
-            u_prev_data[(size_t)i * ny + j] = 0.0;
-        }
-    }
 
     // Create an empty BoundaryMask; barrier segments will be user-managed
     BoundaryMask *bm = boundary_mask_create(grid);
@@ -677,10 +703,13 @@ int main(int argc, char **argv) {
     GLuint damping_prog = 0;
     GLuint damping_tex = 0;
     GLint loc_damp_src = -1, loc_damp_tex = -1, loc_damp_prev = -1, loc_damp_sigma = -1, loc_damp_dt = -1, loc_damp_dims = -1;
-    // Paint texture and CPU paint buffer (RGBA32F)
-    float *paint_buf = calloc((size_t)nx * ny * 4, sizeof(float));
-    GLuint tex_paint = create_empty_texture(nx, ny);
-    int paint_pending = 0;
+    // Paint textures and CPU paint buffer (RGBA32F)
+    paint_buf = calloc((size_t)nx * ny * 4, sizeof(float));
+    tex_paint = create_empty_texture(nx, ny);     /* GPU-generated paint */
+    tex_paint_cpu = create_empty_texture(nx, ny); /* CPU-uploaded paint buffer */
+    paint_pending = 0;
+    paint_from_gpu = 0; /* true when tex_paint was filled by GPU shader this frame */
+    paint_buf_dirty = 0; /* true when paint_buf contains CPU paint that must be uploaded */
     int painting_active = 0;
     uint64_t sim_step_counter = 0; /* counts physics steps (used for source phase) */
     uint64_t render_frame_counter = 0; /* counts rendered frames */
@@ -689,44 +718,6 @@ int main(int argc, char **argv) {
     GLuint fbo; glGenFramebuffers(1, &fbo);
 
     int win_w = 800, win_h = 800;
-
-    /* Debug: readback the uploaded tex_u_curr to ensure the initial Gaussian
-       source was uploaded correctly. Attach tex_u_curr to the FBO and read
-       pixels to compute min/max and a few samples. */
-    {
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_u_curr, 0);
-        GLenum status2 = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (status2 == GL_FRAMEBUFFER_COMPLETE) {
-            /* ensure the viewport matches the FBO texture size for correct readback */
-            glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-            int rw = (int)nx, rh = (int)ny;
-            float *rb = malloc((size_t)rw * rh * 4 * sizeof(float));
-            if (rb) {
-                glReadBuffer(GL_COLOR_ATTACHMENT0);
-                glReadPixels(0, 0, rw, rh, GL_RGBA, GL_FLOAT, rb);
-                double minv = 1e300, maxv = -1e300, sum = 0.0;
-                for (int jj = 0; jj < rh; ++jj) for (int ii = 0; ii < rw; ++ii) {
-                    size_t idx = ((size_t)jj * rw + ii) * 4;
-                    double v = rb[idx+0]; if (v < minv) minv = v; if (v > maxv) maxv = v; sum += v;
-                }
-                double avg = sum / (rw * (double)rh);
-                fprintf(stderr, "DEBUG uploaded tex_u_curr: min=%g max=%g avg=%g\n", minv, maxv, avg);
-                int cx = rw/4, cy = rh/2;
-                for (int dj=-1; dj<=1; ++dj) for (int di=-1; di<=1; ++di) {
-                    int xi = cx + di, yj = cy + dj; size_t id = ((size_t)yj * rw + xi) * 4;
-                    fprintf(stderr, "u_curr sample(%d,%d)=%g\n", xi, yj, rb[id+0]);
-                }
-                fflush(stderr);
-                free(rb);
-            } else fprintf(stderr, "DEBUG: malloc failed for initial tex readback\n");
-            /* restore default framebuffer and viewport */
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glViewport(0,0,win_w,win_h);
-        } else {
-            fprintf(stderr, "DEBUG: FBO incomplete when reading tex_u_curr: 0x%x\n", status2);
-        }
-    }
 
     // Upload the interior barrier mask textures (needs GL context)
     boundary_mask_upload(bm, NULL);
@@ -771,28 +762,6 @@ int main(int argc, char **argv) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, nx, ny, 0, GL_RGBA, GL_FLOAT, damp_buf);
         free(damp_buf);
 
-        /* One-time readback to validate damping texture values and sizes */
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_damping, 0);
-        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
-            int rw = (int)nx, rh = (int)ny;
-            float *rb = malloc((size_t)rw * rh * 4 * sizeof(float));
-            if (rb) {
-                glReadBuffer(GL_COLOR_ATTACHMENT0);
-                glReadPixels(0, 0, rw, rh, GL_RGBA, GL_FLOAT, rb);
-                double minv = 1e300, maxv = -1e300, sum = 0.0; long cnt = 0;
-                for (int j = 0; j < rh; ++j) for (int i = 0; i < rw; ++i) {
-                    size_t idx = ((size_t)j * rw + i) * 4;
-                    double v = rb[idx+0]; if (v < minv) minv = v; if (v > maxv) maxv = v; sum += v; if (v > 0.0) cnt++;
-                }
-                double avg = sum / (rw * (double)rh);
-        fprintf(stderr, "DEBUG damping tex: nx_vis=%d ny_vis=%d damp_gap=%d damp_width=%d sponge=%d total=%dx%d sigma_min=%g sigma_max=%g sigma_avg=%g nonzero=%ld\n",
-            nx_vis, ny_vis, damp_gap, damp_width, sponge, rw, rh, minv, maxv, avg, cnt);
-                free(rb);
-            } else fprintf(stderr, "DEBUG: failed malloc for damping readback\n");
-        } else fprintf(stderr, "DEBUG: FBO incomplete for damping readback\n");
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
         // Damping shader: apply CPU-equivalent sponge
         const char *damp_fs = "#version 120\n"
             "uniform sampler2D next_tex; uniform sampler2D curr_tex; uniform sampler2D prev_tex; uniform sampler2D sigma_tex; uniform float dt; uniform ivec2 dims; void main() { vec2 uv = gl_TexCoord[0].st; vec2 c = (floor(uv * vec2(dims)) + vec2(0.5)) / vec2(dims); float un = texture2D(next_tex, c).r; float uc = texture2D(curr_tex, c).r; float up = texture2D(prev_tex, c).r; float sigma = texture2D(sigma_tex, c).r; float accel = un - 2.0 * uc + up; float sdt = sigma * dt; float unew = (2.0 - sdt) * uc - (1.0 - sdt) * up + accel; gl_FragColor = vec4(unew, 0.0, 0.0, 0.0); }";
@@ -816,71 +785,6 @@ int main(int argc, char **argv) {
     } else {
         fprintf(stderr, "Failed to allocate damping buffer\n");
     }
-    // Debug: verify mask texture content by reading back bytes
-    if (bm && bm->mask_tex) {
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bm->mask_tex, 0);
-        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (st == GL_FRAMEBUFFER_COMPLETE) {
-            int rw = (int)nx, rh = (int)ny;
-            unsigned char *rb = malloc((size_t)rw * rh * 4);
-            if (rb) {
-                glReadBuffer(GL_COLOR_ATTACHMENT0);
-                glReadPixels(0, 0, rw, rh, GL_RGBA, GL_UNSIGNED_BYTE, rb);
-                int nonzero = 0; int maxv = 0; int minv = 255;
-                for (int j = 0; j < rh; ++j) for (int i = 0; i < rw; ++i) {
-                    size_t id = ((size_t)j * rw + i) * 4;
-                    int v = rb[id+0]; if (v) nonzero++;
-                    if (v > maxv) maxv = v; if (v < minv) minv = v;
-                }
-                fprintf(stderr, "DEBUG mask readback: nonzero=%d min=%d max=%d\n", nonzero, minv, maxv);
-                free(rb);
-            } else fprintf(stderr, "DEBUG: failed to malloc mask readback buffer\n");
-        } else fprintf(stderr, "DEBUG: mask FBO incomplete: 0x%x\n", st);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    } else fprintf(stderr, "DEBUG: no bm->mask_tex to readback\n");
-
-    // Debug: readback mask texture to verify the barrier was uploaded correctly
-    if (bm && bm->mask_tex) {
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bm->mask_tex, 0);
-        GLenum stmask = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (stmask == GL_FRAMEBUFFER_COMPLETE) {
-            glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-            unsigned char *rbm = malloc((size_t)nx * ny * 4);
-            if (rbm) {
-                glReadBuffer(GL_COLOR_ATTACHMENT0);
-                glReadPixels(0, 0, (GLsizei)nx, (GLsizei)ny, GL_RGBA, GL_UNSIGNED_BYTE, rbm);
-                int minv = 255, maxv = 0; long sum = 0; int samples = 0;
-                for (int j = 0; j < (int)ny; ++j) for (int i = 0; i < (int)nx; ++i) {
-                    size_t idx = ((size_t)j * nx + i) * 4;
-                    unsigned char v = rbm[idx]; if (v < minv) minv = v; if (v > maxv) maxv = v; sum += v; samples++;
-                }
-                fprintf(stderr, "DEBUG mask readback: min=%d max=%d avg=%g\n", minv, maxv, samples ? (double)sum / samples : 0.0);
-                // sample around the barrier center if available (use texture center)
-                int sample_cx = (int)(nx / 2); int sample_cy = (int)(ny / 2);
-                for (int dj=-1; dj<=1; ++dj) for (int di=-1; di<=1; ++di) {
-                    int xi = sample_cx + di, yj = sample_cy + dj;
-                    if (xi < 0) xi = 0; if (xi >= (int)nx) xi = (int)nx-1; if (yj < 0) yj = 0; if (yj >= (int)ny) yj = (int)ny-1;
-                    /* The texture upload for mask flips the Y axis (so buf row j maps to
-                       bm->mask[i * ny + (ny-1-j)]). glReadPixels returns rows starting at
-                       the framebuffer bottom; therefore the readback buffer row index
-                       corresponding to logical grid row `yj` is (ny-1 - yj). */
-                    int read_y = (int)ny - 1 - yj;
-                    size_t id = ((size_t)read_y * nx + xi) * 4;
-                    fprintf(stderr, "mask sample(%d,%d) [read at (%d,%d)]=%u\n", xi, yj, xi, read_y, (unsigned)rbm[id]);
-                }
-                free(rbm);
-            } else fprintf(stderr, "DEBUG: malloc failed for mask readback\n");
-        } else {
-            fprintf(stderr, "DEBUG: FBO incomplete when reading mask: 0x%x\n", stmask);
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0,0,win_w,win_h);
-    } else {
-        fprintf(stderr, "DEBUG: no mask texture present (bm==%p mask_tex=%u)\n", (void*)bm, bm ? bm->mask_tex : 0);
-    }
-
     // FBO already created above
 
     // Overlay shader to draw white lines where the mask is active (final pass)
@@ -898,28 +802,74 @@ int main(int argc, char **argv) {
     if (ov_vs) glDeleteShader(ov_vs);
     if (ov_fs) glDeleteShader(ov_fs);
 
-    // Prepare a single display shader that supports height, velocity (spatial), and rgb modes
+
+    // Prepare display shader by defining render modes as expressions and compiling
+    // them into a single monolithic shader via the GPU compiler helper.
+    RenderModeDef modes[3]; memset(modes, 0, sizeof(modes));
+    // Mode 0: Height coloring - use a nonlinear mapping so small height differences are exaggerated
+    // R = pow(max(src,0), gamma); B = pow(max(-src,0), gamma)
+    Expression *src_var = expr_variable("src");
+    Expression *zero_lit = expr_literal(literal_create_scalar(0.0));
+    /* gamma < 1 increases small values (e.g. gamma = 0.5 is sqrt) */
+    Expression *gamma_lit = expr_literal(literal_create_scalar(0.5));
+    Expression *pos = expr_binary(OP_MAX, src_var, zero_lit); // max(src, 0)
+    Expression *neg = expr_binary(OP_MAX, expr_unary(OP_NEGATE, expr_variable("src")), zero_lit); // max(-src, 0)
+    Expression *pos_pow = expr_power(pos, gamma_lit);
+    Expression *neg_pow = expr_power(neg, gamma_lit);
+    modes[0].chan_expr[0] = pos_pow;
+    modes[0].chan_expr[1] = NULL;
+    modes[0].chan_expr[2] = neg_pow;
+    modes[0].chan_scale[0] = 0.5; modes[0].chan_scale[1] = 1.0; modes[0].chan_scale[2] = 0.5;
+    modes[0].chan_apply_sqrt[0] = 0; modes[0].chan_apply_sqrt[1] = 0; modes[0].chan_apply_sqrt[2] = 0;
+
+    // Mode 1: velocity magnitude - compute sqrt(dx*dx + dy*dy) and show as grayscale
+    Expression *dx = expr_derivative(expr_variable("src"), "x");
+    Expression *dy = expr_derivative(expr_variable("src"), "y");
+    // build squared sum expression = dx*dx + dy*dy
+    Expression *dx2 = expr_binary(OP_MULTIPLY, dx, dx);
+    Expression *dy2 = expr_binary(OP_MULTIPLY, dy, dy);
+    Expression *sumsq = expr_binary(OP_ADD, dx2, dy2);
+    // take power 0.5 (sqrt) explicitly via expression so GLSL emits pow(...,0.5)
+    Expression *half = expr_literal(literal_create_scalar(0.5));
+    Expression *sumsq_sqrt = expr_power(sumsq, half);
+    modes[1].chan_expr[0] = sumsq_sqrt;
+    modes[1].chan_expr[1] = sumsq_sqrt;
+    modes[1].chan_expr[2] = sumsq_sqrt;
+    // apply modest per-channel scale to avoid saturation
+    modes[1].chan_scale[0] = 0.5; modes[1].chan_scale[1] = 0.5; modes[1].chan_scale[2] = 0.5;
+    modes[1].chan_apply_sqrt[0] = 0; modes[1].chan_apply_sqrt[1] = 0; modes[1].chan_apply_sqrt[2] = 0;
+
+    // Mode 2: RGB mapping: R=dx, G=dy, B=src -- apply small per-channel scales so each fits in range
+    modes[2].chan_expr[0] = expr_derivative(expr_variable("src"), "x");
+    modes[2].chan_expr[1] = expr_derivative(expr_variable("src"), "y");
+    modes[2].chan_expr[2] = expr_variable("src");
+    modes[2].chan_scale[0] = 0.5; modes[2].chan_scale[1] = 0.5; modes[2].chan_scale[2] = 0.5;
+    modes[2].chan_apply_sqrt[0] = 0; modes[2].chan_apply_sqrt[1] = 0; modes[2].chan_apply_sqrt[2] = 0;
+
+    // Compile into GPUProgram
+    GPUProgram *disp_prog_gpu = gpu_compile_render_modes(modes, 3, grid, GPU_BACKEND_OPENGL);
+    // release temporary expressions (may be shared across channels)
+    expression_release(modes[0].chan_expr[0]); expression_release(modes[0].chan_expr[2]);
+    expression_release(modes[1].chan_expr[0]); /* sumsq shared across channels - single release */
+    expression_release(modes[2].chan_expr[0]); expression_release(modes[2].chan_expr[1]); expression_release(modes[2].chan_expr[2]);
+
+    // Fallback: if compilation to GPUProgram failed, fall back to the previous hardcoded shader
+    GLuint disp_prog = 0;
     const char *disp_vs = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-    const char *disp_fs =
-        "#version 120\n"
-        "uniform sampler2D src_tex; uniform sampler2D mask_tex; uniform int render_mode; uniform float value_scale; uniform ivec2 dims; uniform ivec2 vis_offset; uniform ivec2 vis_size; uniform vec2 spacing; uniform int show_boundaries;"
-        "void main() { vec2 texel = vec2(1.0/float(dims.x), 1.0/float(dims.y)); vec2 uv = gl_TexCoord[0].st; vec2 tex_idx = vec2(vis_offset) + uv * vec2(vis_size); vec2 c = (floor(tex_idx) + vec2(0.5)) / vec2(dims);"
-        " float m = texture2D(mask_tex, c).r; if (m > 0.5) { if (show_boundaries != 0) { gl_FragColor = vec4(1.0,1.0,1.0,1.0); } else { gl_FragColor = vec4(0.0,0.0,0.0,1.0); } return; }"
-        " float h = texture2D(src_tex, c).r; vec2 offx = vec2(texel.x, 0.0); vec2 offy = vec2(0.0, texel.y);"
-        " float hl = texture2D(src_tex, c - offx).r; float hr = texture2D(src_tex, c + offx).r; float hd = texture2D(src_tex, c - offy).r; float hu = texture2D(src_tex, c + offy).r;"
-        " float vx = (hr - hl) / (2.0 * spacing.x); float vy = (hu - hd) / (2.0 * spacing.y);"
-        " if (render_mode == 0) { float a = clamp(abs(h * value_scale), 0.0, 1.0); vec3 col = h > 0.0 ? vec3(a,0.0,0.0) : vec3(0.0,0.0,a); gl_FragColor = vec4(col,1.0); return; }"
-        " if (render_mode == 1) { float vmag = sqrt(vx*vx + vy*vy) * value_scale; float g = clamp(vmag, 0.0, 1.0); gl_FragColor = vec4(g,g,g,1.0); return; }"
-        " if (render_mode == 2) { float sr = clamp(0.5 + vx * value_scale * 0.5, 0.0, 1.0); float sg = clamp(0.5 + vy * value_scale * 0.5, 0.0, 1.0); float sb = clamp(0.5 + h * value_scale * 0.5, 0.0, 1.0); gl_FragColor = vec4(sr,sg,sb,1.0); return; }"
-        " gl_FragColor = vec4(0.0,0.0,0.0,1.0); }";
-    GLuint d_vs = compile_shader(GL_VERTEX_SHADER, disp_vs);
-    GLuint d_fs = compile_shader(GL_FRAGMENT_SHADER, disp_fs);
-    GLuint disp_prog = link_program(d_vs, d_fs);
-    glDeleteShader(d_vs); glDeleteShader(d_fs);
+    if (disp_prog_gpu && disp_prog_gpu->kernels && disp_prog_gpu->kernels[0] && disp_prog_gpu->kernels[0]->source) {
+        GLuint d_vs = compile_shader(GL_VERTEX_SHADER, disp_vs);
+        GLuint d_fs = compile_shader(GL_FRAGMENT_SHADER, disp_prog_gpu->kernels[0]->source);
+        if (d_vs && d_fs) disp_prog = link_program(d_vs, d_fs);
+        if (d_vs) glDeleteShader(d_vs); if (d_fs) glDeleteShader(d_fs);
+    }
+    if (!disp_prog) {
+        printf("Display program compile failed; \n");
+        return 1;
+    }
 
     // Create app/menu state + menus
     AppState app = {0};
-    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; /* fixed steps per render default */ app.wave_amplitude = 0.002; /* lower default addition amplitude (scaled) */ app.wave_spread = 0.05; app.default_source_frequency = 5.0; app.default_source_phase = 0.0; app.mouse_none = 1; app.show_base_menu = 1; app.show_mouse_controls = 0; app.show_sim_controls = 0;
+    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; app.dt = 0.002; app.steps_per_frame = 1.0; app.wave_amplitude = 0.002; /* lower default addition amplitude (scaled) */ app.wave_spread = 0.05; app.default_source_frequency = 5.0; app.default_source_phase = 0.0; app.mouse_none = 1; app.show_base_menu = 1; app.show_mouse_controls = 0; app.show_sim_controls = 0; app.max_sim_speed = 1.0; app.limit_fps = 1;
     AppRenderState render = {0};
     render.mode = RENDER_HEIGHT; render.value_scale = 1.0; render.show_boundaries = 1; render.show_stats = 1; render.mode_height = 1; render.mode_velocity = 0; render.mode_rgb = 0;
 
@@ -938,6 +888,7 @@ int main(int argc, char **argv) {
     reset_data->wave_expr_ptr = &wave_expr;
     reset_data->grid_ptr = grid;
     reset_data->dt_val = dt;
+    reset_data->app_wave_speed_ptr = &app.wave_speed;
     reset_data->sim_counter_ptr = &sim_step_counter;
 
      /* Initialize source-menu radius default to match mouse paint spread:
@@ -965,12 +916,62 @@ int main(int argc, char **argv) {
     glUseProgram(0);
 
     // Prepare paint program uniform locations (if created)
-    GLint loc_p_src = -1, loc_p_paint = -1;
+    GLint loc_p_src = -1, loc_p_paint_gpu = -1, loc_p_paint_cpu = -1;
     if (p_prog) {
         glUseProgram(p_prog);
         loc_p_src = glGetUniformLocation(p_prog, "src_tex"); if (loc_p_src >= 0) glUniform1i(loc_p_src, 0);
-        loc_p_paint = glGetUniformLocation(p_prog, "paint_tex"); if (loc_p_paint >= 0) glUniform1i(loc_p_paint, 1);
+        loc_p_paint_gpu = glGetUniformLocation(p_prog, "paint_gpu"); if (loc_p_paint_gpu >= 0) glUniform1i(loc_p_paint_gpu, 1);
+        loc_p_paint_cpu = glGetUniformLocation(p_prog, "paint_cpu"); if (loc_p_paint_cpu >= 0) glUniform1i(loc_p_paint_cpu, 2);
         glUseProgram(0);
+    }
+
+    /* GPU-side source generator program: renders a per-texel paint texture
+       from the active sources (last-source-wins semantics to match CPU). */
+    GLuint srcgen_prog = 0;
+    GLint loc_src_n = -1, loc_src_time = -1, loc_src_dims = -1, loc_src_spacing = -1;
+    /* cached uniform locations for descriptor sampler and max width */
+    GLint loc_src_desc = -1, loc_max_src = -1;
+    GLint loc_src_gx = -1, loc_src_gy = -1, loc_src_amp = -1, loc_src_freq = -1, loc_src_phase = -1, loc_src_radius = -1;
+    {
+        /* Shader reads source descriptors from a 2-row texture: row 0 = (gx, gy, amp, freq), row 1 = (phase, radius, unused, unused) */
+        const char *srcgen_fs =
+            "#version 120\n"
+            "uniform sampler2D src_desc_tex;\n"
+            "uniform int n_sources;\n"
+            "uniform int max_src;\n"
+            "uniform float sim_time; uniform vec2 spacing; uniform ivec2 dims;\n"
+            "void main() { vec2 uv = gl_TexCoord[0].st; vec2 idx = floor(uv * vec2(dims)); float val = 0.0;\n"
+            " for (int i = 0; i < n_sources; ++i) { float fu = (0.5 + float(i)) / float(max_src); vec4 a = texture2D(src_desc_tex, vec2(fu, 0.25)); vec4 b = texture2D(src_desc_tex, vec2(fu, 0.75)); float gx = a.r; float gy = a.g; float amp = a.b; float freq = a.a; float phase = b.r; float radius = b.g; float dx = (idx.x - gx) * spacing.x; float dy = (idx.y - gy) * spacing.y; float r2 = dx*dx + dy*dy; float rr = radius * radius * spacing.x * spacing.x; if (r2 <= rr) { val = amp * sin(freq * sim_time + phase); } }\n"
+            " gl_FragColor = vec4(val, 0.0, 0.0, 0.0); }";
+        GLuint s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint s_fs = compile_shader(GL_FRAGMENT_SHADER, srcgen_fs);
+        if (s_vs && s_fs) srcgen_prog = link_program(s_vs, s_fs);
+        if (s_vs) glDeleteShader(s_vs); if (s_fs) glDeleteShader(s_fs);
+            if (srcgen_prog) {
+            glUseProgram(srcgen_prog);
+            loc_src_n = glGetUniformLocation(srcgen_prog, "n_sources");
+            loc_src_time = glGetUniformLocation(srcgen_prog, "sim_time"); loc_src_dims = glGetUniformLocation(srcgen_prog, "dims"); loc_src_spacing = glGetUniformLocation(srcgen_prog, "spacing");
+            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
+            loc_src_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
+            loc_max_src = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_max_src >= 0) glUniform1i(loc_max_src, 64);
+            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
+            GLint loc_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_desc >= 0) { glUniform1i(loc_desc, 4); }
+            GLint loc_mx = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_mx >= 0) { glUniform1i(loc_mx, 64); }
+            /* create source-descriptor texture (max 64 sources, 2 rows) */
+            glGenTextures(1, &tex_src_desc);
+            glBindTexture(GL_TEXTURE_2D, tex_src_desc);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            /* allocate 64x2 RGBA32F texture, initialize to zero */
+            int max_src = 64;
+            float *zero_buf = calloc((size_t)max_src * 2 * 4, sizeof(float));
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, max_src, 2, 0, GL_RGBA, GL_FLOAT, zero_buf);
+            free(zero_buf);
+            glUseProgram(0);
+        }
     }
 
     // Set GL state (window size)
@@ -988,40 +989,27 @@ int main(int argc, char **argv) {
     GLint loc_show_bound_init = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound_init>=0) glUniform1i(loc_show_bound_init, render.show_boundaries ? 1 : 0);
     glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
     draw_fullscreen_quad();
+
+
+    // save states
+    GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean blendEnabled = glIsEnabled(GL_BLEND);
+    if (depthEnabled) glDisable(GL_DEPTH_TEST);
+    // draw overlay opaque (disable blending so mask is clearly visible)
+    if (blendEnabled) glDisable(GL_BLEND);
+
     // draw overlay lines for mask every frame (use alpha-blend so we can update fragcolor without discard)
-        if (overlay_prog && bm && bm->mask_tex) {
-            // save states
-            GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
-            GLboolean blendEnabled = glIsEnabled(GL_BLEND);
-            if (depthEnabled) glDisable(GL_DEPTH_TEST);
-            // draw overlay opaque (disable blending so mask is clearly visible)
-            if (blendEnabled) glDisable(GL_BLEND);
-            glUseProgram(overlay_prog);
-            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-            GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
-            GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
-            draw_fullscreen_quad();
-            // restore states
-            glUseProgram(0);
-            if (blendEnabled) glEnable(GL_BLEND);
-            if (depthEnabled) glEnable(GL_DEPTH_TEST);
-        }
-    // draw overlay lines for mask
-    if (overlay_prog) {
-        // draw opaque overlay (disable blending to ensure visibility)
-        GLboolean depthE = glIsEnabled(GL_DEPTH_TEST);
-        GLboolean blendE = glIsEnabled(GL_BLEND);
-        if (depthE) glDisable(GL_DEPTH_TEST);
-        if (blendE) glDisable(GL_BLEND);
+    if (overlay_prog && bm && bm->mask_tex) {
         glUseProgram(overlay_prog);
         glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
         GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
         GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
         draw_fullscreen_quad();
-        glUseProgram(0);
-        if (blendE) glEnable(GL_BLEND);
-        if (depthE) glEnable(GL_DEPTH_TEST);
     }
+    // Restore states
+    glUseProgram(0);
+    if (blendEnabled) glEnable(GL_BLEND);
+    if (depthEnabled) glEnable(GL_DEPTH_TEST);
     SDL_GL_SwapWindow(win);
 
      /* Debug helper: print one sample from the mask texture at center after
@@ -1167,6 +1155,8 @@ int main(int argc, char **argv) {
                                 g_n_sources++;
                                 g_selected_source = idx;
                                 sel_src_amp = g_sources[idx].amp; sel_src_freq = g_sources[idx].freq; sel_src_phase = g_sources[idx].phase; sel_src_radius = g_sources[idx].radius;
+                                // Mark descriptors dirty so GPU gets the new source
+                                sources_dirty = 1;
                                 // Do NOT upload an initial gaussian when creating a source - sources influence the field each frame via paint_buf
                             }
                         }
@@ -1255,6 +1245,8 @@ int main(int argc, char **argv) {
                     uint32_t gi = (uint32_t)gix; uint32_t gj = (uint32_t)gjy;
                     paint_gaussian_to_rgba(paint_buf, nx, ny, gi, gj, app.wave_amplitude * MOUSE_AMPLITUDE_SCALE, app.wave_spread, spacing[0], spacing[1]);
                     paint_pending = 1;
+                    paint_buf_dirty = 1;
+                    paint_buf_dirty = 1;
                 } else if (app.mouse_add_barrier) {
                     // If there's a candidate press (near endpoint) but not yet active, check motion threshold
                     if (barrier_drag_candidate && !barrier_drag_active) {
@@ -1305,395 +1297,411 @@ int main(int argc, char **argv) {
                         int gjy = (int)floor(fy * (double)ny_vis) + sponge; if (gjy < (int)sponge) gjy = sponge; if (gjy >= (int)(sponge + ny_vis)) gjy = (int)(sponge + ny_vis - 1);
                         g_sources[source_drag_idx].gx = gix;
                         g_sources[source_drag_idx].gy = gjy;
+                        sources_dirty = 1;
                     }
                 }
             }
         }
 
     // Perform up to N simulation steps per render on GPU (skip when paused)
-    if (!app.paused) {
-        int steps_per_frame = 1; /* fixed single step per render */
-        for (int step = 0; step < steps_per_frame; ++step) {
-            // Apply per-step sources into paint_buf
-            if (g_n_sources > 0 && g_sources) {
-                double t = (double)sim_step_counter * dt;
-                for (int s = 0; s < g_n_sources; ++s) {
-                    Source *S = &g_sources[s];
-                    if (!S) continue;
-                    double src_val = S->amp * sin(S->freq * t + S->phase);
-                    int rad = (int)ceil(S->radius);
-                    int bx0 = S->gx - rad, by0 = S->gy - rad; if (bx0 < 0) bx0 = 0; if (by0 < 0) by0 = 0;
-                    int bx1 = S->gx + rad, by1 = S->gy + rad; if (bx1 >= (int)nx) bx1 = (int)nx-1; if (by1 >= (int)ny) by1 = (int)ny-1;
-                    int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
-                    for (int jj = 0; jj < bh; ++jj) for (int ii = 0; ii < bw; ++ii) {
-                        int gx = bx0 + ii, gy = by0 + jj;
-                        double dx = (gx - S->gx) * spacing[0]; double dy = (gy - S->gy) * spacing[1]; double r2 = dx*dx + dy*dy;
-                        if (r2 <= S->radius * S->radius * spacing[0] * spacing[0]) {
-                            size_t id = ((size_t)gy * nx + (size_t)gx) * 4;
-                            paint_buf[id + 0] = (float)src_val;
+        if (!app.paused) {
+            /* pick dt and steps_per_frame from UI-controlled app state */
+            dt = app.dt; /* runtime dt for sim time and damping uniforms */
+            int steps_per_frame = (int)lround(app.steps_per_frame);
+            if (steps_per_frame < 1) steps_per_frame = 1;
+            if (steps_per_frame > 10) steps_per_frame = 10;
+            for (int step = 0; step < steps_per_frame; ++step) {
+                // Apply per-step sources by running the GPU source generator into tex_paint
+                if (g_n_sources > 0 && g_sources && srcgen_prog) {
+                    int nsrc = g_n_sources > 64 ? 64 : g_n_sources;
+                    /* If descriptors changed, upload src descriptor texture once */
+                    if (sources_dirty) {
+                        int max_src = 64;
+                        /* Fill static descriptor buffer */
+                        for (int i = 0; i < nsrc; ++i) {
+                            src_desc_buf[(0 * max_src + i) * 4 + 0] = (float)g_sources[i].gx;
+                            src_desc_buf[(0 * max_src + i) * 4 + 1] = (float)g_sources[i].gy;
+                            src_desc_buf[(0 * max_src + i) * 4 + 2] = (float)g_sources[i].amp;
+                            src_desc_buf[(0 * max_src + i) * 4 + 3] = (float)g_sources[i].freq;
+                            src_desc_buf[(1 * max_src + i) * 4 + 0] = (float)g_sources[i].phase;
+                            src_desc_buf[(1 * max_src + i) * 4 + 1] = (float)g_sources[i].radius;
+                            src_desc_buf[(1 * max_src + i) * 4 + 2] = 0.0f;
+                            src_desc_buf[(1 * max_src + i) * 4 + 3] = 0.0f;
                         }
+                        glBindTexture(GL_TEXTURE_2D, tex_src_desc);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, max_src, 2, GL_RGBA, GL_FLOAT, src_desc_buf);
+                        
+                        sources_dirty = 0;
                     }
+                    /* Bind FBO to render into tex_paint */
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_paint, 0);
+                    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                    if (st == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
+                        glUseProgram(srcgen_prog);
+                        if (loc_src_n >= 0) glUniform1i(loc_src_n, nsrc);
+                        if (loc_src_time >= 0) glUniform1f(loc_src_time, (float)((double)sim_step_counter * dt));
+                        /* max_src matches descriptor texture width (allocated as 64) */
+                        if (loc_max_src >= 0) glUniform1i(loc_max_src, 64);
+                        if (loc_src_dims >= 0) glUniform2i(loc_src_dims, (GLint)nx, (GLint)ny);
+                        if (loc_src_spacing >= 0) glUniform2f(loc_src_spacing, (float)spacing[0], (float)spacing[1]);
+                        /* bind descriptor texture to texture unit 4 */
+                        glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, tex_src_desc);
+                        if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                        paint_pending = 1;
+                        paint_from_gpu = 1;
+                    } else {
+                        fprintf(stderr, "FBO incomplete for source generation: 0x%x\n", st);
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
                 }
-                paint_pending = 1;
-            }
 
-            // If we have pending paint, upload paint buffer and composite into texture
-            if (paint_pending) {
-                glBindTexture(GL_TEXTURE_2D, tex_paint);
-                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, paint_buf);
-                // composite: render src=tex_u_curr + paint -> tex_out
+                // If we have pending paint, upload paint buffer and composite into texture
+                if (paint_pending) {
+                    /* If CPU paint exists, upload it into tex_paint_cpu once */
+                    if (paint_buf_dirty) {
+                        glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+                        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, paint_buf);
+                        paint_buf_dirty = 0;
+                        paint_cpu_uploaded = 1; /* remember we uploaded non-zero CPU paint */
+                    }
+                    // composite: render src=tex_u_curr + paint -> tex_out
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_out, 0);
+                    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                    if (st == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
+                        glUseProgram(p_prog);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
+                        /* bind GPU paint to unit 1 */
+                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_paint);
+                        /* bind CPU paint to unit 2 */
+                        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+                        if (loc_p_src >= 0) glUniform1i(loc_p_src, 0);
+                        if (loc_p_paint_gpu >= 0) glUniform1i(loc_p_paint_gpu, 1);
+                        if (loc_p_paint_cpu >= 0) glUniform1i(loc_p_paint_cpu, 2);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                        GLuint tmp = tex_u_curr; tex_u_curr = tex_out; tex_out = tmp;
+                    } else {
+                        fprintf(stderr, "FBO incomplete for paint composite: 0x%x\n", st);
+                        fflush(stderr);
+                    }
+                          /* clear CPU paint buffer and upload zeros to cpu paint texture so
+                              CPU additions are applied only once (until user paints again) */
+                          size_t psize = (size_t)nx * ny * 4 * sizeof(float);
+                          /* If we uploaded CPU paint earlier, clear both host buffer and GPU texture.
+                             Otherwise skip the expensive zero upload to keep frames fast when only GPU sources run. */
+                          if (paint_cpu_uploaded) {
+                              if (paint_buf) { memset(paint_buf, 0, psize); }
+                              paint_buf_dirty = 0;
+                              glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+                              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                              glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, paint_buf);
+                              paint_cpu_uploaded = 0;
+                          } else {
+                              /* ensure host paint buffer isn't considered dirty */
+                              if (paint_buf) { /* keep it as-is (likely zero) */ }
+                              paint_buf_dirty = 0;
+                          }
+                          paint_pending = 0;
+                          paint_from_gpu = 0;
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                }
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_out, 0);
-                GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                if (st == GL_FRAMEBUFFER_COMPLETE) {
-                    glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-                    glUseProgram(p_prog);
-                    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_paint);
-                    if (loc_p_src >= 0) glUniform1i(loc_p_src, 0);
-                    if (loc_p_paint >= 0) glUniform1i(loc_p_paint, 1);
-                    glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                    glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-                    draw_fullscreen_quad();
+                GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                if (status != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "FBO incomplete: 0x%x\n", status); break; }
+                /* ensure we render at texture resolution so fragments map 1:1 to texels */
+                glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
+
+                glUseProgram(compute_prog);
+                // Bind inputs: u_curr -> unit 0, u_prev -> unit 1
+                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
+                glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
+                // Bind mask/value textures if present -> units 2,3
+                if (bm && bm->mask_tex) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex); }
+                if (bm && bm->values_tex) { glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, bm->values_tex); }
+
+                // Set uniforms while program is bound (ensure sampler units are wired)
+                if (loc_u_curr >= 0) glUniform1i(loc_u_curr, 0);
+                if (loc_u_prev >= 0) glUniform1i(loc_u_prev, 1);
+                if (loc_mask >= 0) glUniform1i(loc_mask, 2);
+                if (loc_val >= 0) glUniform1i(loc_val, 3);
+                if (loc_dims >= 0) glUniform2i(loc_dims, (GLint)nx, (GLint)ny);
+                if (loc_spacing >= 0) glUniform2f(loc_spacing, (float)spacing[0], (float)spacing[1]);
+                if (loc_use_mask >= 0) glUniform1i(loc_use_mask, bm ? 1 : 0);
+
+                // Draw quad to compute u_next
+                glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                /* GPU timing: sample occasionally to avoid blocking every frame. */
+                uint32_t _gpu_t_before = 0;
+                if (gpu_time_sample_period > 0) _gpu_t_before = SDL_GetTicks();
+                draw_fullscreen_quad();
+                glFlush();
+                gpu_time_step_counter++;
+                if (gpu_time_sample_period > 0 && gpu_time_step_counter >= gpu_time_sample_period) {
                     glFinish();
-                    GLuint tmp = tex_u_curr; tex_u_curr = tex_out; tex_out = tmp;
-                } else {
-                    fprintf(stderr, "FBO incomplete for paint composite: 0x%x\n", st);
-                    fflush(stderr);
+                    uint32_t _gpu_t_after = SDL_GetTicks();
+                    uint32_t _elapsed = (_gpu_t_after > _gpu_t_before) ? (_gpu_t_after - _gpu_t_before) : 0;
+                    double ms_per_step = (double)_elapsed / (double)gpu_time_sample_period;
+                    const double alpha = 0.2;
+                    if (gpu_time_samples == 0) gpu_compute_ms_avg = ms_per_step;
+                    else gpu_compute_ms_avg = alpha * ms_per_step + (1.0 - alpha) * gpu_compute_ms_avg;
+                    gpu_time_samples++;
+                    gpu_time_step_counter = 0;
                 }
-                size_t psize = (size_t)nx * ny * 4 * sizeof(float);
-                memset(paint_buf, 0, psize);
-                paint_pending = 0;
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                glViewport(0,0,win_w,win_h);
-            }
-            glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_out, 0);
-        GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (status != GL_FRAMEBUFFER_COMPLETE) { fprintf(stderr, "FBO incomplete: 0x%x\n", status); break; }
-        /* ensure we render at texture resolution so fragments map 1:1 to texels */
-        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
 
-    glUseProgram(compute_prog);
-    // Bind inputs: u_curr -> unit 0, u_prev -> unit 1
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
-    // Bind mask/value textures if present -> units 2,3
-    if (bm && bm->mask_tex) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex); }
-    if (bm && bm->values_tex) { glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, bm->values_tex); }
+                // Ping-pong: rotate textures so the newly computed tex_out becomes current
+                GLuint tex_prev = tex_u_prev;
+                tex_u_prev = tex_u_curr;
+                tex_u_curr = tex_out;
+                tex_out = tex_prev;
 
-    // Set uniforms while program is bound (ensure sampler units are wired)
-    if (loc_u_curr >= 0) glUniform1i(loc_u_curr, 0);
-    if (loc_u_prev >= 0) glUniform1i(loc_u_prev, 1);
-    if (loc_mask >= 0) glUniform1i(loc_mask, 2);
-    if (loc_val >= 0) glUniform1i(loc_val, 3);
-    if (loc_dims >= 0) glUniform2i(loc_dims, (GLint)nx, (GLint)ny);
-    if (loc_spacing >= 0) glUniform2f(loc_spacing, (float)spacing[0], (float)spacing[1]);
-    if (loc_use_mask >= 0) glUniform1i(loc_use_mask, bm ? 1 : 0);
-
-        // Draw quad to compute u_next
-        glDrawBuffer(GL_COLOR_ATTACHMENT0);
-        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-        draw_fullscreen_quad();
-        glFinish();
-
-        /* Debug: one-time readback of the computed texture to inspect values
-           and verify the compute shader produced non-zero output. */
-        if (!debug_readback_done) {
-            int rw = (int)nx, rh = (int)ny;
-            float *rb = malloc((size_t)rw * rh * 4 * sizeof(float));
-            if (rb) {
-                glReadBuffer(GL_COLOR_ATTACHMENT0);
-                glReadPixels(0, 0, rw, rh, GL_RGBA, GL_FLOAT, rb);
-                double minv = 1e300, maxv = -1e300; double sum = 0.0;
-                for (int jj = 0; jj < rh; ++jj) {
-                    for (int ii = 0; ii < rw; ++ii) {
-                        size_t idx = ((size_t)jj * rw + ii) * 4;
-                        double v = rb[idx+0];
-                        if (v < minv) minv = v;
-                        if (v > maxv) maxv = v;
-                        sum += v;
+                /* Apply damping (sponge) pass: multiply tex_u_curr by damping texture into tex_tmp, then copy back into tex_u_curr */
+                if (damping_prog && damping_tex) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_tmp, 0);
+                    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+                    if (st == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
+                        glUseProgram(damping_prog);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
+                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
+                        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_prev);
+                        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, damping_tex);
+                        GLint loc_next = glGetUniformLocation(damping_prog, "next_tex"); if (loc_next >= 0) glUniform1i(loc_next, 0);
+                        GLint loc_curr = glGetUniformLocation(damping_prog, "curr_tex"); if (loc_curr >= 0) glUniform1i(loc_curr, 1);
+                        GLint loc_prev = glGetUniformLocation(damping_prog, "prev_tex"); if (loc_prev >= 0) glUniform1i(loc_prev, 2);
+                        GLint loc_sigma = glGetUniformLocation(damping_prog, "sigma_tex"); if (loc_sigma >= 0) glUniform1i(loc_sigma, 3);
+                        GLint loc_dt = glGetUniformLocation(damping_prog, "dt"); if (loc_dt >= 0) glUniform1f(loc_dt, (float)dt);
+                        GLint loc_dims_d = glGetUniformLocation(damping_prog, "dims"); if (loc_dims_d >= 0) glUniform2i(loc_dims_d, (GLint)nx, (GLint)ny);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                        GLuint ttmp = tex_u_curr; tex_u_curr = tex_tmp; tex_tmp = ttmp;
+                    } else {
+                        fprintf(stderr, "FBO incomplete for damping pass: 0x%x\n", st);
                     }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
                 }
-                double avg = sum / (rw * (double)rh);
-                fprintf(stderr, "DEBUG compute output: min=%g max=%g avg=%g\n", minv, maxv, avg);
-                /* print a few sample texels near center */
-                int cx = rw/2, cy = rh/2;
-                for (int dj=-1; dj<=1; ++dj) {
-                    for (int di=-1; di<=1; ++di) {
-                        int xi = cx + di, yj = cy + dj;
-                        size_t id = ((size_t)yj * rw + xi) * 4;
-                        fprintf(stderr, "sample(%d,%d)=%g\n", xi, yj, rb[id+0]);
-                    }
-                }
-                    fflush(stderr);
-                    free(rb);
-                } else fprintf(stderr, "DEBUG: malloc failed for readback\n");
-                debug_readback_done = 1;
-            }
-
-            // Ping-pong: rotate textures so the newly computed tex_out becomes current
-            GLuint tex_prev = tex_u_prev;
-            tex_u_prev = tex_u_curr;
-            tex_u_curr = tex_out;
-            tex_out = tex_prev;
-
-            /* Apply damping (sponge) pass: multiply tex_u_curr by damping texture into tex_tmp, then copy back into tex_u_curr */
-            if (damping_prog && damping_tex) {
-                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_tmp, 0);
-                GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                if (st == GL_FRAMEBUFFER_COMPLETE) {
-                    glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-                    glUseProgram(damping_prog);
-                    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
-                    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_prev);
-                    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, damping_tex);
-                    GLint loc_next = glGetUniformLocation(damping_prog, "next_tex"); if (loc_next >= 0) glUniform1i(loc_next, 0);
-                    GLint loc_curr = glGetUniformLocation(damping_prog, "curr_tex"); if (loc_curr >= 0) glUniform1i(loc_curr, 1);
-                    GLint loc_prev = glGetUniformLocation(damping_prog, "prev_tex"); if (loc_prev >= 0) glUniform1i(loc_prev, 2);
-                    GLint loc_sigma = glGetUniformLocation(damping_prog, "sigma_tex"); if (loc_sigma >= 0) glUniform1i(loc_sigma, 3);
-                    GLint loc_dt = glGetUniformLocation(damping_prog, "dt"); if (loc_dt >= 0) glUniform1f(loc_dt, (float)dt);
-                    GLint loc_dims_d = glGetUniformLocation(damping_prog, "dims"); if (loc_dims_d >= 0) glUniform2i(loc_dims_d, (GLint)nx, (GLint)ny);
-                    glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                    glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-                    draw_fullscreen_quad(); glFinish();
-                    GLuint ttmp = tex_u_curr; tex_u_curr = tex_tmp; tex_tmp = ttmp;
-                } else {
-                    fprintf(stderr, "FBO incomplete for damping pass: 0x%x\n", st);
-                }
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                glViewport(0,0,win_w,win_h);
-            }
-            // increment sim counter for each physics step performed
-            sim_step_counter++;
-        } // end steps_per_frame loop
-    } // end not paused
+                // increment sim counter for each physics step performed
+                sim_step_counter++;
+            } // end steps_per_frame loop
+        } // end not paused
 
         // Unbind FBO and restore window viewport
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0,0,win_w,win_h);
 
-    // Render current field to screen using unified display shader
-    glUseProgram(disp_prog);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-    glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-    GLint loc_src = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src>=0) glUniform1i(loc_src, 0);
-    GLint loc_maskd = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_maskd>=0) glUniform1i(loc_maskd, 2);
-    GLint loc_mode = glGetUniformLocation(disp_prog, "render_mode"); if (loc_mode>=0) glUniform1i(loc_mode, render.mode);
-    GLint loc_vscl = glGetUniformLocation(disp_prog, "value_scale"); if (loc_vscl>=0) glUniform1f(loc_vscl, (float)render.value_scale);
-    GLint loc_dims_disp = glGetUniformLocation(disp_prog, "dims"); if (loc_dims_disp>=0) glUniform2i(loc_dims_disp, (GLint)nx, (GLint)ny);
-    GLint loc_vis_off_disp = glGetUniformLocation(disp_prog, "vis_offset"); if (loc_vis_off_disp>=0) glUniform2i(loc_vis_off_disp, (GLint)sponge, (GLint)sponge);
-    GLint loc_vis_size_disp = glGetUniformLocation(disp_prog, "vis_size"); if (loc_vis_size_disp>=0) glUniform2i(loc_vis_size_disp, (GLint)nx_vis, (GLint)ny_vis);
-    GLint loc_spacing_disp = glGetUniformLocation(disp_prog, "spacing"); if (loc_spacing_disp>=0) glUniform2f(loc_spacing_disp, (float)spacing[0], (float)spacing[1]);
-    GLint loc_show_bound = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound>=0) glUniform1i(loc_show_bound, render.show_boundaries ? 1 : 0);
-    glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
-    draw_fullscreen_quad();
-    // Unbind any GL program so menu uses fixed-function pipeline rendering
-    glUseProgram(0);
-    // Draw overlay lines for mask on top of the display but beneath menus
-    if (overlay_prog && bm && bm->mask_tex) {
-        GLboolean depthEnabled_ov = glIsEnabled(GL_DEPTH_TEST);
-        GLboolean blendEnabled_ov = glIsEnabled(GL_BLEND);
-        if (depthEnabled_ov) glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glUseProgram(overlay_prog);
-    glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-    GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
-    GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
-    GLint loc_vis_off_ov = glGetUniformLocation(overlay_prog, "vis_offset"); if (loc_vis_off_ov>=0) glUniform2i(loc_vis_off_ov, (GLint)sponge, (GLint)sponge);
-    GLint loc_vis_size_ov = glGetUniformLocation(overlay_prog, "vis_size"); if (loc_vis_size_ov>=0) glUniform2i(loc_vis_size_ov, (GLint)nx_vis, (GLint)ny_vis);
+        // Render current field to screen using unified display shader
+        glUseProgram(disp_prog);
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
+        glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
+        GLint loc_src = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src>=0) glUniform1i(loc_src, 0);
+        GLint loc_maskd = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_maskd>=0) glUniform1i(loc_maskd, 2);
+        GLint loc_mode = glGetUniformLocation(disp_prog, "render_mode"); if (loc_mode>=0) glUniform1i(loc_mode, render.mode);
+        GLint loc_vscl = glGetUniformLocation(disp_prog, "value_scale"); if (loc_vscl>=0) glUniform1f(loc_vscl, (float)render.value_scale);
+        GLint loc_dims_disp = glGetUniformLocation(disp_prog, "dims"); if (loc_dims_disp>=0) glUniform2i(loc_dims_disp, (GLint)nx, (GLint)ny);
+        GLint loc_vis_off_disp = glGetUniformLocation(disp_prog, "vis_offset"); if (loc_vis_off_disp>=0) glUniform2i(loc_vis_off_disp, (GLint)sponge, (GLint)sponge);
+        GLint loc_vis_size_disp = glGetUniformLocation(disp_prog, "vis_size"); if (loc_vis_size_disp>=0) glUniform2i(loc_vis_size_disp, (GLint)nx_vis, (GLint)ny_vis);
+        GLint loc_spacing_disp = glGetUniformLocation(disp_prog, "spacing"); if (loc_spacing_disp>=0) glUniform2f(loc_spacing_disp, (float)spacing[0], (float)spacing[1]);
+        GLint loc_show_bound = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound>=0) glUniform1i(loc_show_bound, render.show_boundaries ? 1 : 0);
+        glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
         draw_fullscreen_quad();
-        // restore states
+        // Unbind any GL program so menu uses fixed-function pipeline rendering
         glUseProgram(0);
-        if (!blendEnabled_ov) glDisable(GL_BLEND);
-        if (depthEnabled_ov) glEnable(GL_DEPTH_TEST);
-    }
-
-    /* One-shot mask readback to verify mask texture content used by overlay. */
-    if (overlay_debug_print && bm && bm->mask_tex) {
-        overlay_debug_print = 0;
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, bm->mask_tex, 0);
-        GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        if (st == GL_FRAMEBUFFER_COMPLETE) {
-            /* read single center pixel */
-            int cx = (int)(nx/2), cy = (int)(ny/2);
-            unsigned char px[4] = {0,0,0,0};
-            /* glReadPixels reads from the framebuffer origin (bottom-left) */
-            int read_y = (int)ny - 1 - cy;
-            glReadBuffer(GL_COLOR_ATTACHMENT0);
-            glReadPixels(cx, read_y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            fprintf(stderr, "DEBUG overlay mask center pixel (r,g,b,a) = (%u,%u,%u,%u)\n", px[0], px[1], px[2], px[3]);
-            fflush(stderr);
-        } else {
-            fprintf(stderr, "DEBUG: FBO incomplete for overlay mask readback: 0x%x\n", st);
+        // Draw overlay lines for mask on top of the display but beneath menus
+        if (overlay_prog && bm && bm->mask_tex) {
+            GLboolean depthEnabled_ov = glIsEnabled(GL_DEPTH_TEST);
+            GLboolean blendEnabled_ov = glIsEnabled(GL_BLEND);
+            if (depthEnabled_ov) glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUseProgram(overlay_prog);
+            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
+            GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
+            GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
+            GLint loc_vis_off_ov = glGetUniformLocation(overlay_prog, "vis_offset"); if (loc_vis_off_ov>=0) glUniform2i(loc_vis_off_ov, (GLint)sponge, (GLint)sponge);
+            GLint loc_vis_size_ov = glGetUniformLocation(overlay_prog, "vis_size"); if (loc_vis_size_ov>=0) glUniform2i(loc_vis_size_ov, (GLint)nx_vis, (GLint)ny_vis);
+            draw_fullscreen_quad();
+            // restore states
+            glUseProgram(0);
+            if (!blendEnabled_ov) glDisable(GL_BLEND);
+            if (depthEnabled_ov) glEnable(GL_DEPTH_TEST);
         }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0,0,win_w,win_h);
-    }
-    // Ensure menus draw on top: disable depth test and enable alpha blending
-    GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
-    if (depthEnabled) glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    // Render menus on top (ensure texture unit 0 is active for the fixed-function text renderer)
-    glActiveTexture(GL_TEXTURE0);
+
+        // Ensure menus draw on top: disable depth test and enable alpha blending
+        GLboolean depthEnabled = glIsEnabled(GL_DEPTH_TEST);
+        if (depthEnabled) glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        // Render menus on top (ensure texture unit 0 is active for the fixed-function text renderer)
+        glActiveTexture(GL_TEXTURE0);
         // Draw barrier endpoints as small white squares so points are visible to the user
         if (n_barrier_segs > 0) {
-                // Prepare orthographic projection for pixel-aligned quads
-                glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
-                glDisable(GL_TEXTURE_2D);
-                glDisable(GL_LIGHTING);
-                glColor3f(1.0f, 1.0f, 1.0f);
-                glMatrixMode(GL_PROJECTION);
-                glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
-                glMatrixMode(GL_MODELVIEW);
-                glPushMatrix(); glLoadIdentity();
-                const float ps = 6.0f; // point square size in pixels
-                for (int s = 0; s < n_barrier_segs; ++s) {
-                        // endpoint 0
-                        double px0 = (double)(barrier_segs[s].x0 - sponge) / (double)nx_vis * win_w;
-                        double py0 = (double)(barrier_segs[s].y0 - sponge) / (double)ny_vis * win_h;
-                        glBegin(GL_QUADS);
-                            glVertex2f((float)(px0 - ps*0.5), (float)(py0 - ps*0.5));
-                            glVertex2f((float)(px0 + ps*0.5), (float)(py0 - ps*0.5));
-                            glVertex2f((float)(px0 + ps*0.5), (float)(py0 + ps*0.5));
-                            glVertex2f((float)(px0 - ps*0.5), (float)(py0 + ps*0.5));
-                        glEnd();
-                        // endpoint 1
-                        double px1 = (double)(barrier_segs[s].x1 - sponge) / (double)nx_vis * win_w;
-                        double py1 = (double)(barrier_segs[s].y1 - sponge) / (double)ny_vis * win_h;
-                        glBegin(GL_QUADS);
-                            glVertex2f((float)(px1 - ps*0.5), (float)(py1 - ps*0.5));
-                            glVertex2f((float)(px1 + ps*0.5), (float)(py1 - ps*0.5));
-                            glVertex2f((float)(px1 + ps*0.5), (float)(py1 + ps*0.5));
-                            glVertex2f((float)(px1 - ps*0.5), (float)(py1 + ps*0.5));
-                        glEnd();
-                }
-                glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
-                glPopAttrib();
+            // Prepare orthographic projection for pixel-aligned quads
+            glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_LIGHTING);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glMatrixMode(GL_PROJECTION);
+            glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glPushMatrix(); glLoadIdentity();
+            const float ps = 6.0f; // point square size in pixels
+            for (int s = 0; s < n_barrier_segs; ++s) {
+                // endpoint 0
+                double px0 = (double)(barrier_segs[s].x0 - sponge) / (double)nx_vis * win_w;
+                double py0 = (double)(barrier_segs[s].y0 - sponge) / (double)ny_vis * win_h;
+                glBegin(GL_QUADS);
+                glVertex2f((float)(px0 - ps*0.5), (float)(py0 - ps*0.5));
+                glVertex2f((float)(px0 + ps*0.5), (float)(py0 - ps*0.5));
+                glVertex2f((float)(px0 + ps*0.5), (float)(py0 + ps*0.5));
+                glVertex2f((float)(px0 - ps*0.5), (float)(py0 + ps*0.5));
+                glEnd();
+                // endpoint 1
+                double px1 = (double)(barrier_segs[s].x1 - sponge) / (double)nx_vis * win_w;
+                double py1 = (double)(barrier_segs[s].y1 - sponge) / (double)ny_vis * win_h;
+                glBegin(GL_QUADS);
+                glVertex2f((float)(px1 - ps*0.5), (float)(py1 - ps*0.5));
+                glVertex2f((float)(px1 + ps*0.5), (float)(py1 - ps*0.5));
+                glVertex2f((float)(px1 + ps*0.5), (float)(py1 + ps*0.5));
+                glVertex2f((float)(px1 - ps*0.5), (float)(py1 + ps*0.5));
+                glEnd();
+            }
+            glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+            glPopAttrib();
         }
-    // Draw sources as hollow yellow circles (selected one highlighted)
-    if (g_n_sources > 0 && g_sources) {
-        glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
-        glDisable(GL_TEXTURE_2D);
-        glDisable(GL_LIGHTING);
-        glColor3f(1.0f, 1.0f, 0.2f);
+        // Draw sources as hollow yellow circles (selected one highlighted)
+        if (g_n_sources > 0 && g_sources) {
+            glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_LIGHTING);
+            glColor3f(1.0f, 1.0f, 0.2f);
+            glMatrixMode(GL_PROJECTION);
+            glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glPushMatrix(); glLoadIdentity();
+            for (int s = 0; s < g_n_sources; ++s) {
+                double px = GX_TO_WINX(g_sources[s].gx, nx_vis, sponge, win_w);
+                double py = GY_TO_WINY(g_sources[s].gy, ny_vis, sponge, win_h);
+                double rad_px = fmax(4.0, g_sources[s].radius * ((double)win_w / (double)nx_vis));
+                if (g_sources[s].selected) glLineWidth(3.0f); else glLineWidth(1.5f);
+                glBegin(GL_LINE_LOOP);
+                int segs = 24;
+                for (int k = 0; k < segs; ++k) {
+                    double a = 2.0 * M_PI * (double)k / (double)segs;
+                    double vx = px + cos(a) * rad_px;
+                    double vy = py + sin(a) * rad_px;
+                    glVertex2f((float)vx, (float)vy);
+                }
+                glEnd();
+                // Draw a small filled center dot for selected source
+                if (g_sources[s].selected) {
+                    const float ds = 4.0f;
+                    glBegin(GL_QUADS);
+                        glVertex2f((float)(px - ds*0.5), (float)(py - ds*0.5));
+                        glVertex2f((float)(px + ds*0.5), (float)(py - ds*0.5));
+                        glVertex2f((float)(px + ds*0.5), (float)(py + ds*0.5));
+                        glVertex2f((float)(px - ds*0.5), (float)(py + ds*0.5));
+                    glEnd();
+                }
+            }
+            glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+            glPopAttrib();
+        }
+        // If a drag is active, draw the segment being dragged (thin line) using pixel coords
+        if (barrier_drag_active && barrier_drag_seg >= 0 && barrier_drag_seg < n_barrier_segs) {
+            glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+            glDisable(GL_TEXTURE_2D);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            glMatrixMode(GL_PROJECTION);
+            glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glPushMatrix(); glLoadIdentity();
+            double x0 = (double)(barrier_segs[barrier_drag_seg].x0 - sponge) / (double)nx_vis * win_w;
+            double y0 = (double)(barrier_segs[barrier_drag_seg].y0 - sponge) / (double)ny_vis * win_h;
+            double x1 = (double)(barrier_segs[barrier_drag_seg].x1 - sponge) / (double)nx_vis * win_w;
+            double y1 = (double)(barrier_segs[barrier_drag_seg].y1 - sponge) / (double)ny_vis * win_h;
+            glLineWidth(2.0f);
+            glBegin(GL_LINES);
+            glVertex2f((float)x0, (float)y0); glVertex2f((float)x1, (float)y1);
+            glEnd();
+            glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+            glPopAttrib();
+        }
+        // If a pending start point exists (before second click), draw it as small white square
+        if (barrier_pending) {
+            glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+            glDisable(GL_TEXTURE_2D);
+            glColor3f(1.0f,1.0f,1.0f);
+            glMatrixMode(GL_PROJECTION);
+            glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            glPushMatrix(); glLoadIdentity();
+            double px = (double)(barrier_pending_x - sponge) / (double)nx_vis * win_w;
+            double py = (double)(barrier_pending_y - sponge) / (double)ny_vis * win_h;
+            const float ps = 6.0f;
+            glBegin(GL_QUADS);
+            glVertex2f((float)(px - ps*0.5), (float)(py - ps*0.5));
+            glVertex2f((float)(px + ps*0.5), (float)(py - ps*0.5));
+            glVertex2f((float)(px + ps*0.5), (float)(py + ps*0.5));
+            glVertex2f((float)(px - ps*0.5), (float)(py + ps*0.5));
+            glEnd();
+            glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+            glPopAttrib();
+        }
+        if (menus && menus->base_menu && app.show_base_menu) menu_render(menus->base_menu, win_w, win_h);
+        if (menus && menus->mouse_menu && app.show_mouse_controls) menu_render(menus->mouse_menu, win_w, win_h);
+        if (menus && menus->sim_menu && app.show_sim_controls) menu_render(menus->sim_menu, win_w, win_h);
+        // Render source menu only when in Source mouse mode and a source is selected
+        if (menus && menus->source_menu && app.mouse_source && g_selected_source >= 0) menu_render(menus->source_menu, win_w, win_h);
+        // Render current mouse mode as text in the corner like CPU sim
+        const char *mmode = "None";
+        if (app.mouse_add_wave) mmode = "Add Wave";
+        else if (app.mouse_add_barrier) mmode = "Barrier";
+        else if (app.mouse_source) mmode = "Source";
+        // draw at top-right corner with slight padding
+        char modebuf[64]; snprintf(modebuf, sizeof(modebuf), "Mouse Mode: %s", mmode);
+        int tw = 0, th = 0;
+        int xpos = win_w - 10 - (int)strlen(modebuf)*8;
+        if (menu_measure_text(modebuf, &tw, &th) == 0) xpos = win_w - 10 - tw;
+        /* menu_draw_text_at expects an orthographic pixel projection; set it briefly here */
         glMatrixMode(GL_PROJECTION);
-        glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, win_w, win_h, 0, -1, 1);
         glMatrixMode(GL_MODELVIEW);
-        glPushMatrix(); glLoadIdentity();
-                for (int s = 0; s < g_n_sources; ++s) {
-                        double px = GX_TO_WINX(g_sources[s].gx, nx_vis, sponge, win_w);
-                        double py = GY_TO_WINY(g_sources[s].gy, ny_vis, sponge, win_h);
-                        double rad_px = fmax(4.0, g_sources[s].radius * ((double)win_w / (double)nx_vis));
-                        if (g_sources[s].selected) glLineWidth(3.0f); else glLineWidth(1.5f);
-                        glBegin(GL_LINE_LOOP);
-                        int segs = 24;
-                        for (int k = 0; k < segs; ++k) {
-                            double a = 2.0 * M_PI * (double)k / (double)segs;
-                            double vx = px + cos(a) * rad_px;
-                            double vy = py + sin(a) * rad_px;
-                            glVertex2f((float)vx, (float)vy);
-                        }
-                        glEnd();
-                        // Draw a small filled center dot for selected source
-                        if (g_sources[s].selected) {
-                            const float ds = 4.0f;
-                            glBegin(GL_QUADS);
-                                glVertex2f((float)(px - ds*0.5), (float)(py - ds*0.5));
-                                glVertex2f((float)(px + ds*0.5), (float)(py - ds*0.5));
-                                glVertex2f((float)(px + ds*0.5), (float)(py + ds*0.5));
-                                glVertex2f((float)(px - ds*0.5), (float)(py + ds*0.5));
-                            glEnd();
-                        }
-                }
-        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
-        glPopAttrib();
-    }
-                // If a drag is active, draw the segment being dragged (thin line) using pixel coords
-                if (barrier_drag_active && barrier_drag_seg >= 0 && barrier_drag_seg < n_barrier_segs) {
-                        glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
-                        glDisable(GL_TEXTURE_2D);
-                        glColor3f(1.0f, 1.0f, 1.0f);
-                        glMatrixMode(GL_PROJECTION);
-                        glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
-                        glMatrixMode(GL_MODELVIEW);
-                        glPushMatrix(); glLoadIdentity();
-                        double x0 = (double)(barrier_segs[barrier_drag_seg].x0 - sponge) / (double)nx_vis * win_w;
-                        double y0 = (double)(barrier_segs[barrier_drag_seg].y0 - sponge) / (double)ny_vis * win_h;
-                        double x1 = (double)(barrier_segs[barrier_drag_seg].x1 - sponge) / (double)nx_vis * win_w;
-                        double y1 = (double)(barrier_segs[barrier_drag_seg].y1 - sponge) / (double)ny_vis * win_h;
-                        glLineWidth(2.0f);
-                        glBegin(GL_LINES);
-                            glVertex2f((float)x0, (float)y0); glVertex2f((float)x1, (float)y1);
-                        glEnd();
-                        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
-                        glPopAttrib();
-                }
-                // If a pending start point exists (before second click), draw it as small white square
-                if (barrier_pending) {
-                        glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
-                        glDisable(GL_TEXTURE_2D);
-                        glColor3f(1.0f,1.0f,1.0f);
-                        glMatrixMode(GL_PROJECTION);
-                        glPushMatrix(); glLoadIdentity(); glOrtho(0, win_w, win_h, 0, -1, 1);
-                        glMatrixMode(GL_MODELVIEW);
-                        glPushMatrix(); glLoadIdentity();
-                        double px = (double)(barrier_pending_x - sponge) / (double)nx_vis * win_w;
-                        double py = (double)(barrier_pending_y - sponge) / (double)ny_vis * win_h;
-                        const float ps = 6.0f;
-                        glBegin(GL_QUADS);
-                            glVertex2f((float)(px - ps*0.5), (float)(py - ps*0.5));
-                            glVertex2f((float)(px + ps*0.5), (float)(py - ps*0.5));
-                            glVertex2f((float)(px + ps*0.5), (float)(py + ps*0.5));
-                            glVertex2f((float)(px - ps*0.5), (float)(py + ps*0.5));
-                        glEnd();
-                        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
-                        glPopAttrib();
-                }
-    if (menus && menus->base_menu && app.show_base_menu) menu_render(menus->base_menu, win_w, win_h);
-    if (menus && menus->mouse_menu && app.show_mouse_controls) menu_render(menus->mouse_menu, win_w, win_h);
-    if (menus && menus->sim_menu && app.show_sim_controls) menu_render(menus->sim_menu, win_w, win_h);
-    // Render source menu only when in Source mouse mode and a source is selected
-    if (menus && menus->source_menu && app.mouse_source && g_selected_source >= 0) menu_render(menus->source_menu, win_w, win_h);
-    // Render current mouse mode as text in the corner like CPU sim
-    const char *mmode = "None";
-    if (app.mouse_add_wave) mmode = "Add Wave";
-    else if (app.mouse_add_barrier) mmode = "Barrier";
-    else if (app.mouse_source) mmode = "Source";
-    // draw at top-right corner with slight padding
-    char modebuf[64]; snprintf(modebuf, sizeof(modebuf), "Mouse Mode: %s", mmode);
-    int tw = 0, th = 0;
-    int xpos = win_w - 10 - (int)strlen(modebuf)*8;
-    if (menu_measure_text(modebuf, &tw, &th) == 0) xpos = win_w - 10 - tw;
-    /* menu_draw_text_at expects an orthographic pixel projection; set it briefly here */
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    glOrtho(0, win_w, win_h, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
-    menu_draw_text_at(modebuf, xpos, 10, (Color){255,255,255,255});
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);
-    // restore GL state
-    glDisable(GL_BLEND);
-    if (depthEnabled) glEnable(GL_DEPTH_TEST);
-        // Draw stats in bottom-left if enabled
-    if (render.show_stats) {
+        glPushMatrix();
+        glLoadIdentity();
+        menu_draw_text_at(modebuf, xpos, 10, (Color){255,255,255,255});
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+        // restore GL state
+        glDisable(GL_BLEND);
+        if (depthEnabled) glEnable(GL_DEPTH_TEST);
+            // Draw stats in bottom-left if enabled
+        if (render.show_stats) {
             char statsbuf[256];
             // compute render FPS from last_time difference
             uint32_t now_stats = SDL_GetTicks();
             uint32_t dt_ms = now_stats - last_time;
             double render_fps = dt_ms > 0 ? 1000.0 / (double)dt_ms : 0.0;
-            double sim_fps = 1.0 / dt; // steps per second (simulation rate)
+            double sim_fps = 1.0 / dt; /* fallback */
+            if (gpu_time_samples > 0 && gpu_compute_ms_avg > 0.0) sim_fps = 1000.0 / gpu_compute_ms_avg;
             snprintf(statsbuf, sizeof(statsbuf), "render_fps: %.1f\nsim_fps: %.1f\nframe: %llu", render_fps, sim_fps, (unsigned long long)render_frame_counter);
             // ensure orthographic projection as expected by menu_draw_text_at
             glMatrixMode(GL_PROJECTION);
@@ -1707,9 +1715,13 @@ int main(int argc, char **argv) {
 
         // Simple frame timing throttle (cap ~60 FPS)
         uint32_t now = SDL_GetTicks(); uint32_t elapsed = now - last_time;
-        if (elapsed < 16) SDL_Delay(16 - elapsed);
-        last_time = SDL_GetTicks();
-    render_frame_counter++;
+        if (app.limit_fps) {
+            if (elapsed < 16) SDL_Delay(16 - elapsed);
+            last_time = SDL_GetTicks();
+        } else {
+            last_time = now;
+        }
+        render_frame_counter++;
     }
 
     // Cleanup
@@ -1722,7 +1734,7 @@ int main(int argc, char **argv) {
     free(u_curr_data); free(u_prev_data);
     if (paint_buf) free(paint_buf);
     gpu_program_free(prog);
-    expression_free(wave_expr);
+    expression_release(wave_expr);
     grid_metadata_free(grid);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return 0;
