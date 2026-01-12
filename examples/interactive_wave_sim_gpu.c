@@ -284,6 +284,25 @@ static void on_render_mode_change(VariableInteraction *vi, void *user_data) {
     else if (vi->variable == &r->mode_rgb) { r->mode_rgb = 1; r->mode = RENDER_RGB; }
 }
 
+// Ensure mouse and sim control menus are mutually exclusive when toggled
+static void cb_toggle_mouse_menu(VariableInteraction *vi, void *user_data) {
+    if (!vi || !user_data) return;
+    AppState *app = (AppState*)user_data;
+    /* If enabling mouse menu, disable sim menu */
+    if (vi->variable == &app->show_mouse_controls) {
+        if (*(int*)vi->variable) app->show_sim_controls = 0;
+    }
+}
+
+static void cb_toggle_sim_menu(VariableInteraction *vi, void *user_data) {
+    if (!vi || !user_data) return;
+    AppState *app = (AppState*)user_data;
+    /* If enabling sim menu, disable mouse menu */
+    if (vi->variable == &app->show_sim_controls) {
+        if (*(int*)vi->variable) app->show_mouse_controls = 0;
+    }
+}
+
 static void cycle_mouse_mode(AppState *app, int dir) {
     int modes[4] = { app->mouse_none, app->mouse_add_wave, app->mouse_add_barrier, app->mouse_source };
     int idx = 0;
@@ -305,10 +324,10 @@ static AppMenus *create_app_menus(AppState *app, AppRenderState *render, void *r
     Color baseBg = {50,50,60,220};
     m->base_menu = menu_create(10,10,250,150,1,"Controls", textColor, baseBg);
     MenuRow *r1 = menurow_create();
-    menurow_add_interaction(r1, variableinteraction_create(&app->show_mouse_controls, "Mouse Controls", 0, 1, VAR_BOOL, NULL, NULL));
+    menurow_add_interaction(r1, variableinteraction_create(&app->show_mouse_controls, "Mouse Controls", 0, 1, VAR_BOOL, cb_toggle_mouse_menu, app));
     menu_add_row(m->base_menu, r1);
     MenuRow *r2 = menurow_create();
-    menurow_add_interaction(r2, variableinteraction_create(&app->show_sim_controls, "Sim Controls", 0, 1, VAR_BOOL, NULL, NULL));
+    menurow_add_interaction(r2, variableinteraction_create(&app->show_sim_controls, "Sim Controls", 0, 1, VAR_BOOL, cb_toggle_sim_menu, app));
     menu_add_row(m->base_menu, r2);
 
     // Mouse menu
@@ -330,7 +349,7 @@ static AppMenus *create_app_menus(AppState *app, AppRenderState *render, void *r
     menurow_add_interaction(mrow4, variableinteraction_create(&app->wave_spread, "Spread", 0.01, 0.2, VAR_SLIDER, NULL, NULL));
     menu_add_row(m->mouse_menu, mrow4);
     MenuRow *mrow5 = menurow_create();
-    menurow_add_interaction(mrow5, variableinteraction_create(&app->default_source_frequency, "Source Freq (Hz)\t", 0.5, 50.0, VAR_SLIDER, NULL, NULL));
+    menurow_add_interaction(mrow5, variableinteraction_create(&app->default_source_frequency, "Source Freq (Hz)\t", 0.5, 300.0, VAR_SLIDER, NULL, NULL));
     menu_add_row(m->mouse_menu, mrow5);
     MenuRow *mrow6 = menurow_create();
     menurow_add_interaction(mrow6, variableinteraction_create(&app->default_source_phase, "Source Phase (rad)", 0.0, 6.28, VAR_SLIDER, NULL, NULL));
@@ -358,7 +377,7 @@ static AppMenus *create_app_menus(AppState *app, AppRenderState *render, void *r
     m->source_menu = menu_create(530,10,250,220,1,"Source Controls", textColor, bgColor);
     // increase source amplitude control range by one order of magnitude
     MenuRow *src1 = menurow_create(); menurow_add_interaction(src1, variableinteraction_create(&sel_src_amp, "Amp", -0.1, 0.1, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src1);
-    MenuRow *src2 = menurow_create(); menurow_add_interaction(src2, variableinteraction_create(&sel_src_freq, "Freq (Hz)", 0.0, 200.0, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src2);
+    MenuRow *src2 = menurow_create(); menurow_add_interaction(src2, variableinteraction_create(&sel_src_freq, "Freq (Hz)", 0.0, 300.0, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src2);
     MenuRow *src3 = menurow_create(); menurow_add_interaction(src3, variableinteraction_create(&sel_src_phase, "Phase (rad)", 0.0, 6.283, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src3);
     MenuRow *src4 = menurow_create(); menurow_add_interaction(src4, variableinteraction_create(&sel_src_radius, "Radius (grid)", 1.0, 50.0, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src4);
     MenuRow *src5 = menurow_create(); menurow_add_interaction(src5, variableinteraction_create(&sel_src_deselect, "Deselect", 0, 1, VAR_BOOL, cb_deselect_selected_source, NULL)); menu_add_row(m->source_menu, src5);
