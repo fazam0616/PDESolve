@@ -577,7 +577,7 @@ void update_source_menu(Menu **source_menu_ptr, WaveSource *source) {
     
     MenuRow *freq_row = menurow_create();
     menurow_add_interaction(freq_row,
-        variableinteraction_create(&source->frequency, "Freq (Hz)     ", 0.5, 50.0, VAR_SLIDER,
+        variableinteraction_create(&source->frequency, "Freq (Hz)\t", 0.5, 50.0, VAR_SLIDER,
                                   NULL, NULL));
     menu_add_row(*source_menu_ptr, freq_row);
     

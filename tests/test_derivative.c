@@ -6,18 +6,22 @@
 #include "../include/dictionary.h"
 
 // Helper to print expression (simplified version)
-void print_expr_value(Expression *expr, Dictionary *vars) {
+// Returns 1 on success, 0 if evaluation failed
+int print_expr_value(Expression *expr, Dictionary *vars) {
     Literal *result = expression_evaluate(expr, vars);
     if (result) {
         printf("%.6f", result->field[0]);
         literal_free(result);
+        return 1;
     } else {
         printf("(eval failed)");
+        return 0;
     }
 }
 
 int main(void) {
     printf("Testing derivative computation\n\n");
+    int all_ok = 1;
     
     // Test 1: d(2*a - 2)/da should be 2
     printf("Test 1: d(2*a - 2)/da\n");
@@ -37,7 +41,7 @@ int main(void) {
     dict_set(vars, "a", lit_a);
     literal_free(lit_a);
     
-    print_expr_value(deriv1, vars);
+    if (!print_expr_value(deriv1, vars)) all_ok = 0;
     printf(" (should be 2.0)\n");
     
     expression_free(expr1);
@@ -57,7 +61,7 @@ int main(void) {
     dict_set(vars2, "a", lit_a2);
     literal_free(lit_a2);
     
-    print_expr_value(deriv2, vars2);
+    if (!print_expr_value(deriv2, vars2)) all_ok = 0;
     printf(" (should be 6.0)\n");
     
     expression_free(expr2);
@@ -77,7 +81,7 @@ int main(void) {
     dict_set(vars3, "a", lit_a3);
     literal_free(lit_a3);
     
-    print_expr_value(deriv3, vars3);
+    if (!print_expr_value(deriv3, vars3)) all_ok = 0;
     printf(" (should be 1.0)\n");
     
     expression_free(expr3);
@@ -85,5 +89,5 @@ int main(void) {
     dict_free(vars3);
     
     printf("\nAll tests complete\n");
-    return 0;
+    return all_ok ? 0 : 1;
 }

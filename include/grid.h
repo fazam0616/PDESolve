@@ -45,6 +45,161 @@ typedef struct {
 // Grid Metadata
 // ============================================================================
 
+// Forward-declare BoundaryMask so GridMetadata can optionally reference an
+// attached mask without pulling in the full boundary header here.
+struct BoundaryMask;
+
+typedef struct GridMetadata {
+    uint32_t *dims;
+    double *spacing;
+    double *origin;
+    uint32_t total_points;
+    double *extent;
+    BoundarySpec *boundaries;
+    HyperplaneBoundary *interior_boundaries;
+    int n_interior_boundaries;
+    int n_dims;
+    int refcount;
+    uint32_t *strides; /* precomputed strides */
+    /* Optional non-owning pointer to an attached BoundaryMask */
+    struct BoundaryMask *attached_mask;
+} GridMetadata;
+
+GridMetadata* grid_metadata_create(const uint32_t *dims,
+                                   const double *spacing,
+                                   const double *origin,
+                                   int n_dims);
+void grid_metadata_free(GridMetadata *grid);
+void grid_metadata_retain(GridMetadata *grid);
+uint32_t grid_get_total_points(const GridMetadata *grid);
+uint32_t grid_index_to_linear(const GridMetadata *grid, const uint32_t *indices);
+void grid_linear_to_index(const GridMetadata *grid, uint32_t linear, uint32_t *indices);
+void grid_index_to_coord(const GridMetadata *grid, const uint32_t* indices, double* coords);
+bool grid_coord_to_index(const GridMetadata *grid, const double* coords, uint32_t* indices);
+bool grid_is_boundary(const GridMetadata *grid, const uint32_t* indices);
+
+// ============================================================================
+// Grid Field
+// ============================================================================
+
+typedef struct {
+    char *name;
+    GridMetadata *grid;
+    Literal data;
+} GridField;
+
+GridField* grid_field_create(GridMetadata *grid);
+void grid_field_free(GridField *field);
+Literal* grid_field_get(const GridField *field, const uint32_t *indices);
+void grid_field_set(GridField *field, const uint32_t *indices, const Literal* value);
+Literal grid_field_evaluate(const GridField *field, const double *coords);
+void grid_field_fill(GridField *field, const Literal* value);
+void grid_field_init_from_function(GridField *field, Literal* (*func)(const double *coords, int n_dims));
+
+GridField* grid_field_derivative(const GridField *field, int axis, int order);
+GridField* grid_field_derivative_compact(const GridField *field, int axis, int order);
+GridField* grid_field_laplacian(const GridField *field);
+int grid_field_laplacian_into(const GridField *field, GridField *out);
+GridField* grid_field_laplacian_compact(const GridField *field);
+GridField** grid_field_gradient(const GridField *field);
+
+GridField* grid_field_add(const GridField *a, const GridField *b);
+GridField* grid_field_multiply(const GridField *a, const GridField *b);
+GridField* grid_field_scale(const GridField *field, double scalar);
+void grid_field_scale_inplace(GridField *field, double scalar);
+int grid_field_axpy(GridField *y, double a, const GridField *x);
+int grid_field_pointwise_multiply_into(const GridField *a, const GridField *b, GridField *out);
+int grid_field_copy_into(const GridField *src, GridField *dst);
+double grid_field_norm(const GridField *field);
+GridField* grid_field_copy(const GridField *field);
+GridField* grid_field_subtract(const GridField *a, const GridField *b);
+GridField* grid_field_shift(const GridField *field, int axis, int shift);
+GridField* grid_field_wrap_literal(Literal *lit, GridMetadata *grid);
+
+const char* grid_axis_name(int axis);
+int grid_axis_from_name(const char *name);
+bool grid_literal_matches(const Literal *lit, const GridMetadata *grid);
+
+void grid_set_boundary(GridMetadata *grid, int axis, int side,
+                       BoundaryType type, double value);
+void grid_set_boundary_func(GridMetadata *grid, int axis, int side,
+                            BoundaryType type, BCFunction func);
+void grid_set_robin_boundary(GridMetadata *grid, int axis, int side,
+                             double alpha, double beta, double gamma);
+void grid_set_open_boundary(GridMetadata *grid, int axis, int side, int order);
+int grid_add_hyperplane_boundary(GridMetadata *grid,
+                                 const double *normal,
+                                 const double *point,
+                                 const double *bounds_min,
+                                 const double *bounds_max,
+                                 BoundaryType type,
+                                 double value);
+int grid_add_hyperplane_boundary_func(GridMetadata *grid,
+                                      const double *normal,
+                                      const double *point,
+                                      const double *bounds_min,
+                                      const double *bounds_max,
+                                      BoundaryType type,
+                                      BCFunction func);
+int grid_point_near_boundary(const GridMetadata *grid, const double *coords);
+void grid_update_bc_time(GridMetadata *grid, double t);
+
+// Optional helpers to attach/detach a BoundaryMask to GridMetadata.
+void grid_set_boundary_mask(GridMetadata *grid, struct BoundaryMask *bm);
+struct BoundaryMask* grid_get_boundary_mask(GridMetadata *grid);
+
+#endif // GRID_H
+#ifndef GRID_H
+#define GRID_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include "literal.h"
+
+// ============================================================================
+// Boundary Condition Types
+// ============================================================================
+
+typedef enum {
+    BC_DIRICHLET,
+    BC_NEUMANN,
+    BC_ROBIN,
+    BC_PERIODIC,
+    BC_OPEN,
+    BC_REFLECT
+} BoundaryType;
+
+typedef double (*BCFunction)(const double *coords, double t);
+
+typedef struct {
+    BoundaryType type;
+    double value;
+    BCFunction func;
+    double time;
+    double alpha, beta, gamma;
+    double reflection_coeff;
+    int extrapolation_order;
+} BoundarySpec;
+
+typedef struct {
+    double *normal;
+    double *point;
+    double *bounds_min;
+    double *bounds_max;
+    double *bbox_min;
+    double *bbox_max;
+    BoundarySpec bc_spec;
+    bool active;
+} HyperplaneBoundary;
+
+// ============================================================================
+// Grid Metadata
+// ============================================================================
+
+// Forward-declare BoundaryMask so GridMetadata can optionally reference an
+// attached mask without pulling in the full boundary header here.
+struct BoundaryMask;
+
 typedef struct GridMetadata {
     uint32_t *dims;
     double *spacing;
@@ -225,6 +380,8 @@ typedef struct GridMetadata {
     // strides[i] = dims[i+1] * dims[i+2] * ... * dims[n-1]
     // Eliminates repeated multiplication in grid_linear_to_index (32.86% bottleneck)
     uint32_t *strides;      // Cumulative strides for index conversion
+    // Optional BoundaryMask attached to this grid metadata. Non-owning pointer.
+    struct BoundaryMask *attached_mask;
 } GridMetadata;
 
 // Create uniform grid
@@ -445,6 +602,12 @@ int grid_point_near_boundary(const GridMetadata *grid, const double *coords);
 
 // Update time parameter for time-dependent BCs
 void grid_update_bc_time(GridMetadata *grid, double t);
+
+// Optional helpers to attach/detach a BoundaryMask to GridMetadata. These are
+// lightweight accessors used by the GPU runtime when auto-generating or
+// querying attached masks.
+void grid_set_boundary_mask(GridMetadata *grid, struct BoundaryMask *bm);
+struct BoundaryMask* grid_get_boundary_mask(GridMetadata *grid);
 
 // Copy grid field
 GridField* grid_field_copy(const GridField *field);

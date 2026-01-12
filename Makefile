@@ -1,9 +1,9 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -Wall -Wextra -Iinclude -O3 -march=native -ffast-math -fopenmp -flto
-LDFLAGS = -fopenmp -flto
+LDFLAGS = -fopenmp -flto $(SDL_LDFLAGS)
 SDL_CFLAGS = $(shell sdl2-config --cflags)
-SDL_LDFLAGS = $(shell sdl2-config --libs) -lGL -lSDL2_ttf
+SDL_LDFLAGS = $(shell sdl2-config --libs) -lGL -lGLEW -lSDL2_ttf
 
 # Directories
 SRC_DIR = src

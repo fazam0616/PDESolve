@@ -68,7 +68,7 @@ int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) 
         int ry = menu->y + title_h + (int)r * row_h;
         int slot_w = menu->width / (int)cols;
 
-        for (size_t c = 0; c < cols; ++c) {
+    for (size_t c = 0; c < cols; ++c) {
             VariableInteraction *vi = (VariableInteraction*)row->interactions->items[c];
             int rx = menu->x + (int)c * slot_w;
             int pad = 8;
@@ -122,6 +122,18 @@ int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) 
         }
     }
 
+    // If the click was inside the menu rect but none of the children handled it,
+    // we still consider the event consumed to prevent clicks from passing through
+    // transparent menu areas into the underlying simulation.
+    int menu_x0 = menu->x, menu_y0 = menu->y, menu_w = menu->width, menu_h = menu->height;
+    if (point_in_rect(mx, my, menu_x0, menu_y0, menu_w, menu_h)) {
+        if (state == SDL_RELEASED) {
+            int was_dragging = menu->dragging;
+            menu->dragging = 0; menu->active_interaction = NULL;
+            return was_dragging ? 1 : 1; // consumed
+        }
+        return 1; // consumed even on press
+    }
     if (state == SDL_RELEASED) {
         int was_dragging = menu->dragging;
         menu->dragging = 0;
@@ -165,7 +177,8 @@ static void draw_text(Menu *menu, const char *text, int x, int y) {
     SDL_Color sc = { menu->textColor.r, menu->textColor.g, menu->textColor.b, menu->textColor.a };
     SDL_Surface *surf = TTF_RenderUTF8_Blended(g_font, text, sc);
     if (!surf) return;
-    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ABGR8888, 0);
+    /* Convert to a surface with RGBA byte order so we can upload with GL_RGBA/GL_UNSIGNED_BYTE */
+    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGBA32, 0);
     SDL_FreeSurface(surf);
     if (!conv) return;
 
@@ -174,6 +187,9 @@ static void draw_text(Menu *menu, const char *text, int x, int y) {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, conv->w, conv->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
 
     glEnable(GL_BLEND);
@@ -211,7 +227,8 @@ void menu_draw_text_at(const char *text, int x, int y, Color color) {
     SDL_Color sc = { color.r, color.g, color.b, color.a };
     SDL_Surface *surf = TTF_RenderUTF8_Blended(g_font, text, sc);
     if (!surf) return;
-    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_ABGR8888, 0);
+    /* Convert to a surface with RGBA byte order so we can upload with GL_RGBA/GL_UNSIGNED_BYTE */
+    SDL_Surface *conv = SDL_ConvertSurfaceFormat(surf, SDL_PIXELFORMAT_RGBA32, 0);
     SDL_FreeSurface(surf);
     if (!conv) return;
 
@@ -220,6 +237,9 @@ void menu_draw_text_at(const char *text, int x, int y, Color color) {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, conv->w, conv->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
 
     glEnable(GL_BLEND);

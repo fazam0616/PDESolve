@@ -33,6 +33,7 @@ void print_expr_tree(Expression *expr, int depth) {
 
 int main(void) {
     printf("Testing derivative: d(2*a)/da\n\n");
+    int all_ok = 1;
     
     // Create expression: 2*a
     Expression *two = make_scalar(2.0);
@@ -60,6 +61,7 @@ int main(void) {
         literal_free(result);
     } else {
         printf("Evaluation failed!\n");
+        all_ok = 0;
     }
     
     // Try simplifying
@@ -75,6 +77,7 @@ int main(void) {
         literal_free(result2);
     } else {
         printf("Evaluation failed!\n");
+        all_ok = 0;
     }
     
     dict_free(vars);
@@ -82,5 +85,5 @@ int main(void) {
     expression_free(deriv);
     expression_free(simplified);
     
-    return 0;
+    return all_ok ? 0 : 1;
 }
