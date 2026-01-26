@@ -24,6 +24,7 @@ struct VariableInteraction {
     void *variable;
     char *name;
     double min, max;
+    double step; // 0 for continuous, >0 to snap to increments
     VariableType type;
     InteractionCallback on_change; // called when value changes
     void *callback_data;
@@ -54,6 +55,8 @@ void menu_add_row(Menu *menu, MenuRow *row);
 MenuRow* menurow_create();
 void menurow_add_interaction(MenuRow *row, VariableInteraction *interaction);
 VariableInteraction* variableinteraction_create(void *variable, const char *name, double min, double max, VariableType type, InteractionCallback on_change, void *callback_data);
+// Optional: set step size for sliders. If step <= 0, slider is continuous.
+void variableinteraction_set_step(VariableInteraction *vi, double step);
 // Input handling for menus
 // mouse_button: button state SDL_PRESSED/SDL_RELEASED
 // These return 1 if the menu consumed/handled the event, 0 otherwise.

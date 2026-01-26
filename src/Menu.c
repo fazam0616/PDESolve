@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 Menu* menu_create(int x, int y, int width, int height, int z_index, const char *title, Color textColor, Color bgColor) {
     Menu *menu = (Menu*)malloc(sizeof(Menu));
@@ -40,10 +41,16 @@ VariableInteraction* variableinteraction_create(void *variable, const char *name
     vi->name = strdup(name);
     vi->min = min;
     vi->max = max;
+    vi->step = 0.0; // default: continuous
     vi->type = type;
     vi->on_change = on_change;
     vi->callback_data = callback_data;
     return vi;
+}
+
+void variableinteraction_set_step(VariableInteraction *vi, double step) {
+    if (!vi) return;
+    if (step <= 0.0) vi->step = 0.0; else vi->step = step;
 }
 
 // Helper: check if point in rect
@@ -97,7 +104,13 @@ int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) 
                     if (cur < vi->min) cur = vi->min;
                     if (cur > vi->max) cur = vi->max;
                 }
-                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+                /* Compact formatting: use scientific for very small/large magnitudes, otherwise fixed with 3 decimals */
+                double a = fabs(cur);
+                if ((a > 0.0 && a < 1e-3) || a >= 1e4) {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.2e", vi->name, cur);
+                } else {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.3f", vi->name, cur);
+                }
 
                 int label_w = 0, label_h = 0;
                 if (menu_measure_text(labelbuf, &label_w, &label_h) != 0) label_w = 0;
@@ -112,6 +125,13 @@ int menu_handle_mouse_button(Menu *menu, int button, int state, int mx, int my) 
                     double t = (double)(mx - bar_x) / (double)bar_w;
                     if (t < 0) t = 0; if (t > 1) t = 1;
                     double val = vi->min + t * (vi->max - vi->min);
+                    /* snap to step if specified */
+                    if (vi->step > 0.0) {
+                        double n = round((val - vi->min) / vi->step);
+                        val = vi->min + n * vi->step;
+                        if (val < vi->min) val = vi->min;
+                        if (val > vi->max) val = vi->max;
+                    }
                     *(double*)vi->variable = val;
                     if (vi->on_change) vi->on_change(vi, vi->callback_data);
                     menu->active_interaction = vi;
@@ -313,7 +333,13 @@ int menu_handle_mouse_motion(Menu *menu, int mx, int my) {
                     if (cur < vi->min) cur = vi->min;
                     if (cur > vi->max) cur = vi->max;
                 }
-                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+                /* Compact formatting for active/dragging label */
+                double a = fabs(cur);
+                if ((a > 0.0 && a < 1e-3) || a >= 1e4) {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.2e", vi->name, cur);
+                } else {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.3f", vi->name, cur);
+                }
                 labelptr = labelbuf;
             }
             if (menu_measure_text(labelptr, &label_w, &label_h) != 0) label_w = 0;
@@ -324,6 +350,13 @@ int menu_handle_mouse_motion(Menu *menu, int mx, int my) {
             double t = (double)(mx - bar_x) / (double)bar_w;
             if (t < 0) t = 0; if (t > 1) t = 1;
             double val = vi->min + t * (vi->max - vi->min);
+            /* snap to step if specified */
+            if (vi->step > 0.0) {
+                double n = round((val - vi->min) / vi->step);
+                val = vi->min + n * vi->step;
+                if (val < vi->min) val = vi->min;
+                if (val > vi->max) val = vi->max;
+            }
             *(double*)vi->variable = val;
             if (vi->on_change) vi->on_change(vi, vi->callback_data);
             return 1;
@@ -384,7 +417,13 @@ void menu_render(Menu *menu, int window_w, int window_h) {
                     if (cur < vi->min) cur = vi->min;
                     if (cur > vi->max) cur = vi->max;
                 }
-                snprintf(labelbuf, sizeof(labelbuf), "%s: %.2f", vi->name, cur);
+                /* Compact formatting for drawn label */
+                double a = fabs(cur);
+                if ((a > 0.0 && a < 1e-3) || a >= 1e4) {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.3e", vi->name, cur);
+                } else {
+                    snprintf(labelbuf, sizeof(labelbuf), "%s: %.3f", vi->name, cur);
+                }
                 labelptr = labelbuf;
             }
             if (menu_measure_text(labelptr, &label_w, &label_h) != 0) label_w = 0;

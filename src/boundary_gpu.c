@@ -70,7 +70,8 @@ static GLuint create_texture_from_mask(BoundaryMask *bm) {
     unsigned char *buf = calloc(nx * ny * 4, 1);
     for (uint32_t j = 0; j < ny; ++j) {
         for (uint32_t i = 0; i < nx; ++i) {
-            size_t off = (size_t)i * ny + (ny - 1 - j);
+            /* Use direct (i,j) ordering so texture upload matches shader UV coordinates (no Y-flip) */
+            size_t off = (size_t)i * ny + j;
             uint8_t m = bm->mask[off];
             size_t idx = ((size_t)j * nx + i) * 4;
             buf[idx+0] = m ? 255 : 0;
@@ -91,7 +92,8 @@ static GLuint create_texture_from_values(BoundaryMask *bm) {
     float *buf = calloc(nx * ny * 4, sizeof(float));
     for (uint32_t j = 0; j < ny; ++j) {
         for (uint32_t i = 0; i < nx; ++i) {
-            size_t off = (size_t)i * ny + (ny - 1 - j);
+            /* Use direct (i,j) ordering so texture upload matches shader UV coordinates (no Y-flip) */
+            size_t off = (size_t)i * ny + j;
             double v = bm->values[off];
             size_t idx = ((size_t)j * nx + i) * 4;
             buf[idx+0] = (float)v;

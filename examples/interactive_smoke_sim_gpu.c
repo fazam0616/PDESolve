@@ -57,14 +57,14 @@ static GLuint link_program(GLuint vs, GLuint fs) {
 // Create an RGBA32F texture and upload provided single-channel float data
 static GLuint create_texture_from_field(const double *field, uint32_t nx, uint32_t ny) {
     float *buf = calloc((size_t)nx * ny * 4, sizeof(float));
-    for (uint32_t j = 0; j < ny; ++j) {
-        uint32_t src_j = ny - 1 - j; // flip vertically for GL
-        for (uint32_t i = 0; i < nx; ++i) {
-            size_t off = (size_t)i * ny + src_j;
-            double v = field ? field[off] : 0.0;
-            size_t idx = ((size_t)j * nx + i) * 4;
-            buf[idx+0] = (float)v;
-            buf[idx+1] = 0.0f; buf[idx+2] = 0.0f; buf[idx+3] = 0.0f;
+        for (uint32_t j = 0; j < ny; ++j) {
+            uint32_t src_j = ny - 1 - j; // flip vertically for GL
+            for (uint32_t i = 0; i < nx; ++i) {
+                    size_t off = (size_t)src_j * nx + i; // Corrected indexing
+                double v = field ? field[off] : 0.0;
+                size_t idx = ((size_t)j * nx + i) * 4;
+                    buf[idx+0] = (float)v; // Apply value_scale to the texture
+                buf[idx+1] = 0.0f; buf[idx+2] = 0.0f; buf[idx+3] = 0.0f;
         }
     }
     GLuint tex; glGenTextures(1, &tex);
@@ -128,7 +128,7 @@ static void paint_gaussian_to_rgba(float *buf, uint32_t nx, uint32_t ny,
             // But create_texture_from_field used dest j as 0..ny-1 and set src_j = ny-1-j from data source. Here we write into dest layout directly.
             int jdest = (int)y; // destination row index
             size_t idx = ((size_t)jdest * nx + (size_t)x) * 4;
-            buf[idx + 0] += (float)val;
+            buf[idx + 0] += (float)val; // Accumulate values for painting
         }
     }
 }
@@ -158,7 +158,7 @@ static void paint_gaussian_to_rgba_channel(float *buf, uint32_t nx, uint32_t ny,
             double val = amp * exp(-r2 / (2.0 * sigma * sigma));
             int jdest = (int)y;
             size_t idx = ((size_t)jdest * nx + (size_t)x) * 4;
-            buf[idx + channel] += (float)val;
+                                            buf[idx + channel] += (float)val * 10.0; // Scale the value for the specific channel
         }
     }
 }
@@ -167,7 +167,7 @@ static void paint_gaussian_to_rgba_channel(float *buf, uint32_t nx, uint32_t ny,
 static int debug_per_stage = 1;
 
 // Simple render / app state used by the menu callbacks
-typedef enum { RENDER_VELOCITY = 1, RENDER_PRESSURE = 2, RENDER_SMOKE = 3, RENDER_VORTICITY = 4, RENDER_DIVERGENCE = 5 } AppRenderMode;
+typedef enum { RENDER_VELOCITY = 1, RENDER_PRESSURE = 2, RENDER_SMOKE = 3, RENDER_VORTICITY = 4, RENDER_DIVERGENCE = 5, RENDER_TEMPERATURE = 6 } AppRenderMode;
 typedef struct {
     AppRenderMode mode;
     double value_scale;
@@ -178,6 +178,8 @@ typedef struct {
     int mode_smoke;
     int mode_vorticity;
     int mode_divergence;
+    int mode_temperature;
+    double mode_slider; /* UI slider to select render mode (1..n), kept as double for slider storage */
 } AppRenderState;
 
 // Minimal app state for menu callbacks (CPU-side only; simulation actions are no-ops)
@@ -210,6 +212,14 @@ typedef struct {
     double sor_alpha;    /* SOR relaxation parameter (omega) */
     double sor_iters;       /* number of red-black SOR iterations per step */
     double pressure_width; /* width multiplier used in pressure update formula */
+    /* Physical params */
+    double viscosity_nu;   /* kinematic viscosity */
+    double gravity_x;      /* gravity vector x */
+    double gravity_y;      /* gravity vector y */
+    double temp_kappa;     /* thermal diffusivity */
+    double visc_iters;     /* implicit viscosity solver iterations (per step) */
+    /* Buoyancy coefficient (beta) controlling strength of buoyant forcing */
+    double buoyancy_beta;
 } AppState;
 
 // Source representation (grid coords)
@@ -231,6 +241,7 @@ typedef struct {
 
 // Helper macros to map window coords (mx,my) to grid indices (gix,gjy) using visible region and sponge
 #define WIN_TO_GX(mx, win_w, nx_vis, sponge) ((int)floor((double)(mx) / (double)(win_w) * (double)(nx_vis)) + (sponge))
+/* Map window Y to grid Y with vertical flip (match GL texture upload orientation) */
 #define WIN_TO_GY(my, win_h, ny_vis, sponge) ((int)floor((1.0 - (double)(my) / (double)(win_h)) * (double)(ny_vis)) + (sponge))
 // Grid -> window pixel mapping for overlay drawing (match WIN_TO_GY flip)
 #define GX_TO_WINX(gx, nx_vis, sponge, win_w) (((double)(gx) - (double)(sponge)) / (double)(nx_vis) * (double)(win_w))
@@ -244,6 +255,9 @@ static void cb_deselect_selected_source(VariableInteraction *vi, void *user_data
 static Source *g_sources = NULL;
 static int g_n_sources = 0;
 static int g_selected_source = -1;
+/* Global boundary mask pointer and grid dims so menu callbacks can access them */
+static BoundaryMask *g_bm = NULL;
+static uint32_t g_grid_nx = 0, g_grid_ny = 0;
 /* GPU-side source descriptor texture and dirty flag (file-scope so callbacks can set it) */
 static GLuint tex_src_desc = 0;
 static int sources_dirty = 1; /* mark true to upload initial data */
@@ -270,8 +284,11 @@ static GLuint tex_pressure_tmp = 0;  /* ping-pong for pressure iterations */
 static GLuint tex_divergence = 0;    /* divergence (rhs) texture */
 static GLuint tex_velocity = 0;      /* velocity packed in RG channels */
 static GLuint tex_velocity_tmp = 0;  /* temp for advected velocity */
+static GLuint tex_velocity_rhs = 0;  /* RHS copy for implicit viscosity solver */
 static GLuint tex_smoke = 0;         /* advected smoke scalar in R */
 static GLuint tex_smoke_tmp = 0;     /* temp for smoke advection */
+static GLuint tex_temp = 0;          /* temperature scalar (R) */
+static GLuint tex_temp_tmp = 0;      /* temp for temperature advection */
 
 /* helper single-channel velocity textures (vx, vy stored in R channel) */
 static GLuint tex_velocity_x = 0, tex_velocity_y = 0;
@@ -284,12 +301,18 @@ static GLuint prog_advect_velocity = 0; /* advect velocity field */
 static GLuint prog_advect_smoke = 0; /* advect smoke scalar */
 static GLuint prog_mask_velocity = 0; /* mask velocity with barrier (zero orthogonal components) */
 static GLuint prog_mask_smoke = 0;    /* mask smoke scalar at/near barriers */
+static GLuint prog_advect_temp = 0; /* advect temperature scalar */
+static GLuint prog_buoyancy = 0;   /* add buoyancy force to velocity */
+static GLuint prog_viscosity = 0;  /* kept for compatibility but unused (old explicit) */
+static GLuint prog_visc_jacobi = 0; /* implicit viscosity solver (red-black Jacobi) */
+static GLuint prog_diffuse_temp = 0; /* diffusion for temperature */
 /* small helper programs: extract components and pack components into RG */
 static GLuint prog_extract_vx = 0, prog_extract_vy = 0, prog_pack_velocity = 0;
 /* projection programs produced from expressions: compute vx_new (R) and vy_new (R) */
 static GLuint prog_proj_vx = 0, prog_proj_vy = 0;
 static GLuint prog_add_paint_smoke = 0; /* composite paint -> smoke */
 static GLuint prog_add_paint_pressure = 0; /* composite paint -> pressure */
+static GLuint prog_add_paint_temp = 0; /* composite paint -> temperature */
 
 /* Uniform locations cache */
 static GLint loc_proj_pressure = -1, loc_proj_vel = -1, loc_proj_dims = -1, loc_proj_spacing = -1;
@@ -299,19 +322,26 @@ static GLint loc_div_vx = -1, loc_div_vy = -1;
 static GLint loc_jacobi_p = -1, loc_jacobi_b = -1, loc_jacobi_color = -1, loc_jacobi_dims = -1, loc_jacobi_spacing = -1, loc_jacobi_alpha = -1, loc_jacobi_width = -1;
 static GLint loc_advect_vel = -1, loc_advect_smoke = -1;
 static GLint loc_advect_smoke_vel = -1; /* sampler location for vel_tex in smoke advect */
+static GLint loc_advect_smoke_mask = -1; /* sampler location for mask_tex in smoke advect */
 static GLint loc_advect_vel_dims = -1, loc_advect_vel_dt = -1, loc_advect_vel_spacing = -1;
 static GLint loc_advect_smoke_dims = -1, loc_advect_smoke_dt = -1, loc_advect_smoke_spacing = -1;
+static GLint loc_advect_temp = -1, loc_advect_temp_vel = -1, loc_advect_temp_mask = -1;
+static GLint loc_advect_temp_dims = -1, loc_advect_temp_dt = -1, loc_advect_temp_spacing = -1;
+static GLint loc_buoyancy_temp = -1, loc_buoyancy_vel = -1, loc_buoyancy_beta = -1, loc_buoyancy_T0 = -1, loc_buoyancy_dt = -1, loc_buoyancy_gravity = -1;
+static GLint loc_viscosity_nu = -1, loc_viscosity_dt = -1, loc_viscosity_dims = -1, loc_viscosity_spacing = -1;
+static GLint loc_visc_jacobi_vel = -1, loc_visc_jacobi_rhs = -1, loc_visc_jacobi_dims = -1, loc_visc_jacobi_spacing = -1, loc_visc_jacobi_nu = -1, loc_visc_jacobi_dt = -1, loc_visc_jacobi_color = -1, loc_visc_jacobi_use_mask = -1;
+static GLint loc_diffuse_temp_k = -1, loc_diffuse_temp_dt = -1, loc_diffuse_temp_dims = -1, loc_diffuse_temp_spacing = -1;
 static GLint loc_mask_prevvel = -1, loc_mask_mask = -1, loc_mask_dims = -1;
 static GLint loc_mask_smoke_prev = -1, loc_mask_smoke_mask = -1, loc_mask_smoke_dims = -1;
 static GLint loc_add_paint_target = -1, loc_add_paint_tex = -1, loc_add_paint_cpu = -1;
 
 
 // Controls mirrored into the source menu for the currently-selected source
-static double sel_src_amp = 0.0;
+    static double sel_src_amp = 0.0;
 static double sel_src_freq = 1.0;
 static double sel_src_phase = 0.0;
 static double sel_src_radius = 6.0; // in grid units
-    static int sel_src_target = 0; /* 0=smoke, 1=pressure */
+    static double sel_src_target = 0.0; /* slider-backed: 0=smoke,1=pressure,2=temperature */
 // menu action booleans for source menu buttons
 static int sel_src_deselect = 0;
 static int sel_src_delete = 0;
@@ -324,9 +354,23 @@ static void cb_source_control_changed(VariableInteraction *vi, void *user_data) 
         g_sources[g_selected_source].freq = sel_src_freq;
         g_sources[g_selected_source].phase = sel_src_phase;
         g_sources[g_selected_source].radius = sel_src_radius;
-            g_sources[g_selected_source].target = sel_src_target ? 1 : 0;
+            g_sources[g_selected_source].target = (int)lround(sel_src_target); /* allow 0/1/2 via rounded slider */
     sources_dirty = 1;
     }
+}
+
+static void on_src_target_slider_change(VariableInteraction *vi, void *user_data) {
+    if (!vi) return;
+    double val = *(double*)vi->variable;
+    int mode = (int)lround(val);
+    if (mode < 0) mode = 0; if (mode > 2) mode = 2;
+    const char *names[] = { "Smoke", "Pressure", "Temperature" };
+    if (vi->name) free(vi->name);
+    size_t nb = strlen("Target: ") + strlen(names[mode]) + 1;
+    vi->name = (char*)malloc(nb);
+    snprintf(vi->name, nb, "Target: %s", names[mode]);
+    fprintf(stderr, "[DBG] on_src_target_slider_change called: val=%f mode=%d name=%s\n", val, mode, vi->name); fflush(stderr);
+    /* also update mirror variable (already reflected in vi->variable) */
 }
 
 static void cb_delete_selected_source(VariableInteraction *vi, void *user_data) {
@@ -396,6 +440,32 @@ static void on_render_mode_change(VariableInteraction *vi, void *user_data) {
     else if (vi->variable == &r->mode_smoke) { r->mode_smoke = 1; r->mode = RENDER_SMOKE; }
     else if (vi->variable == &r->mode_vorticity) { r->mode_vorticity = 1; r->mode = RENDER_VORTICITY; }
     else if (vi->variable == &r->mode_divergence) { r->mode_divergence = 1; r->mode = RENDER_DIVERGENCE; }
+    else if (vi->variable == &r->mode_temperature) { r->mode_temperature = 1; r->mode = RENDER_TEMPERATURE; }
+    // mask-debug mode removed
+}
+
+/* Slider callback: update render.mode from integer slider and update the slider label to show selected mode */
+static void on_render_mode_slider_change(VariableInteraction *vi, void *user_data) {
+    if (!vi || !user_data) return;
+    AppRenderState *r = (AppRenderState*)user_data;
+    double val = *(double*)vi->variable;
+    int mode = (int)round(val);
+    if (mode < RENDER_VELOCITY) mode = RENDER_VELOCITY;
+    if (mode > RENDER_TEMPERATURE) mode = RENDER_TEMPERATURE;
+    r->mode = (AppRenderMode)mode;
+    /* update per-mode flags for compatibility with any code checking them */
+    r->mode_velocity = (r->mode == RENDER_VELOCITY);
+    r->mode_pressure = (r->mode == RENDER_PRESSURE);
+    r->mode_smoke = (r->mode == RENDER_SMOKE);
+    r->mode_vorticity = (r->mode == RENDER_VORTICITY);
+    r->mode_divergence = (r->mode == RENDER_DIVERGENCE);
+    r->mode_temperature = (r->mode == RENDER_TEMPERATURE);
+    /* programmatically update the interaction's name to include the selected mode */
+    const char *names[] = { "", "Velocity", "Pressure", "Smoke", "Vorticity", "Divergence", "Temperature" };
+    if (vi->name) free(vi->name);
+    size_t nb = strlen("Mode: ") + strlen(names[mode]) + 1;
+    vi->name = (char*)malloc(nb);
+    snprintf(vi->name, nb, "Mode: %s", names[mode]);
 }
 
 // Ensure mouse and sim control menus are mutually exclusive when toggled
@@ -473,39 +543,56 @@ static AppMenus *create_app_menus(AppState *app, AppRenderState *render, void *r
     menurow_add_interaction(mrow6, variableinteraction_create(&app->default_source_phase, "Source Phase (rad)", 0.0, 6.28, VAR_SLIDER, NULL, NULL));
     menu_add_row(m->mouse_menu, mrow6);
 
-    // Sim menu
-    m->sim_menu = menu_create(270,10,250,340,1,"Simulation Controls", textColor, bgColor);
+    // Sim menu (wider for longer slider labels)
+    m->sim_menu = menu_create(270,10,320,360,1,"Simulation Controls", textColor, bgColor);
     MenuRow *s1 = menurow_create(); menurow_add_interaction(s1, variableinteraction_create(&app->paused, "Paused", 0, 1, VAR_BOOL, NULL, app)); menu_add_row(m->sim_menu, s1);
     MenuRow *s2 = menurow_create(); menurow_add_interaction(s2, variableinteraction_create(&app->dummy_reset, "Reset", 0, 1, VAR_BOOL, cb_reset, reset_cb_data)); menu_add_row(m->sim_menu, s2);
     // Wave speed slider: allow values from 0.01 .. 2.0
-    MenuRow *s3 = menurow_create(); menurow_add_interaction(s3, variableinteraction_create(&app->wave_speed, "Wave Speed", 0.01, 4.0, VAR_SLIDER, cb_wave_speed_changed, reset_cb_data)); menu_add_row(m->sim_menu, s3);
+    // Wave speed not used in this simulation variant; remove slider
     // Timestep dt slider: very small .. double initial value
     MenuRow *s4 = menurow_create(); menurow_add_interaction(s4, variableinteraction_create(&app->dt, "dt (s)", 1e-6, fmax(1e-6, 2.0 * ((reset_cb_data_t*)reset_cb_data)->dt_val), VAR_SLIDER, cb_dt_changed, reset_cb_data)); menu_add_row(m->sim_menu, s4);
     // Number of compute iterations per render (1..10 integer steps)
     MenuRow *s4b = menurow_create(); menurow_add_interaction(s4b, variableinteraction_create(&app->steps_per_frame, "Steps/frame", 1.0, 10.0, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s4b);
     MenuRow *s5 = menurow_create(); menurow_add_interaction(s5, variableinteraction_create(&render->value_scale, "Scale", 0.001, 10.0, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s5);
-    MenuRow *s6 = menurow_create(); menurow_add_interaction(s6, variableinteraction_create(&app->dummy_clear_barriers, "Clear Barriers", 0, 1, VAR_BOOL, cb_clear_barriers, NULL)); menu_add_row(m->sim_menu, s6);
-    MenuRow *s7 = menurow_create(); menurow_add_interaction(s7, variableinteraction_create(&app->dummy_clear_sources, "Clear Sources", 0, 1, VAR_BOOL, cb_clear_sources, NULL)); menu_add_row(m->sim_menu, s7);
-    MenuRow *s9b = menurow_create(); menurow_add_interaction(s9b, variableinteraction_create(&app->limit_fps, "Limit FPS to ~60", 0, 1, VAR_BOOL, NULL, NULL)); menu_add_row(m->sim_menu, s9b);
+    // Physical parameter sliders: viscosity (nu), gravity (x/y), temperature diffusivity (kappa)
+    MenuRow *s_visc = menurow_create(); menurow_add_interaction(s_visc, variableinteraction_create(&app->viscosity_nu, "Viscosity", 1e-8, 5e-2, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_visc);
+    MenuRow *s_visc_it = menurow_create(); menurow_add_interaction(s_visc_it, variableinteraction_create(&app->visc_iters, "Visc Jacobi iters", 0.0, 200.0, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_visc_it);
+    MenuRow *s_gx = menurow_create(); menurow_add_interaction(s_gx, variableinteraction_create(&app->gravity_x, "Gravity X", -50.0, 50.0, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_gx);
+    MenuRow *s_gy = menurow_create(); menurow_add_interaction(s_gy, variableinteraction_create(&app->gravity_y, "Gravity Y", -50.0, 50.0, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_gy);
+    MenuRow *s_k = menurow_create(); menurow_add_interaction(s_k, variableinteraction_create(&app->temp_kappa, "Temp Diff", 1e-8, 1e-2, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_k);
+    /* Buoyancy strength slider */
+    MenuRow *s_b = menurow_create(); menurow_add_interaction(s_b, variableinteraction_create(&app->buoyancy_beta, "Buoyancy (beta)", 0.0, 0.1, VAR_SLIDER, NULL, app)); menu_add_row(m->sim_menu, s_b);
+    /* Put Clear Barriers and Clear Sources on the same row and pass pointers as user_data */
+    MenuRow *s6 = menurow_create();
+    /* Use NULL user_data; callbacks reference global g_bm, paint_buf, tex_paint_cpu, and g_grid_nx/g_grid_ny */
+    menurow_add_interaction(s6, variableinteraction_create(&app->dummy_clear_barriers, "Clear Barriers", 0, 1, VAR_BOOL, cb_clear_barriers, NULL));
+    menurow_add_interaction(s6, variableinteraction_create(&app->dummy_clear_sources, "Clear Sources", 0, 1, VAR_BOOL, cb_clear_sources, NULL));
+    menu_add_row(m->sim_menu, s6);
     // Pressure solver controls
     MenuRow *s12b = menurow_create(); menurow_add_interaction(s12b, variableinteraction_create(&app->sor_alpha, "SOR alpha (omega)", 1.0, 1.95, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s12b);
     MenuRow *s12c = menurow_create(); menurow_add_interaction(s12c, variableinteraction_create(&app->sor_iters, "SOR iters/frame", 0, 200, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s12c);
     MenuRow *s12d = menurow_create(); menurow_add_interaction(s12d, variableinteraction_create(&app->pressure_width, "Pressure width", 0.0, 4.0, VAR_SLIDER, NULL, NULL)); menu_add_row(m->sim_menu, s12d);
-    // render mode radio buttons: Velocity / Pressure / Smoke / Vorticity
-    MenuRow *s10 = menurow_create(); menurow_add_interaction(s10, variableinteraction_create(&render->mode_velocity, "Mode: Velocity", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s10);
-    MenuRow *s11 = menurow_create(); menurow_add_interaction(s11, variableinteraction_create(&render->mode_pressure, "Mode: Pressure", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s11);
-    MenuRow *s12 = menurow_create(); menurow_add_interaction(s12, variableinteraction_create(&render->mode_smoke, "Mode: Smoke", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s12);
-    MenuRow *s13 = menurow_create(); menurow_add_interaction(s13, variableinteraction_create(&render->mode_vorticity, "Mode: Vorticity", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s13);
-    MenuRow *s14 = menurow_create(); menurow_add_interaction(s14, variableinteraction_create(&render->mode_divergence, "Mode: Divergence", 0, 1, VAR_BOOL, on_render_mode_change, render)); menu_add_row(m->sim_menu, s14);
+    // Single slider to select render mode (integer steps). Replace radio buttons to save vertical space.
+    render->mode_slider = (double)render->mode; /* initialize from current mode */
+    MenuRow *s_mode = menurow_create();
+    VariableInteraction *mode_vi = variableinteraction_create(&render->mode_slider, "Mode: Velocity", (double)RENDER_VELOCITY, (double)RENDER_TEMPERATURE, VAR_SLIDER, on_render_mode_slider_change, render);
+    variableinteraction_set_step(mode_vi, 1.0); /* snap to integer modes */
+    menurow_add_interaction(s_mode, mode_vi); menu_add_row(m->sim_menu, s_mode);
 
     // source_menu left empty for now
     m->source_menu = menu_create(530,10,250,220,1,"Source Controls", textColor, bgColor);
-    // increase source amplitude control range by one order of magnitude
-    MenuRow *src1 = menurow_create(); menurow_add_interaction(src1, variableinteraction_create(&sel_src_amp, "Amp", 0.0, 0.1, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src1);
+    // increase source amplitude control range: allow negative amplitudes as well
+    MenuRow *src1 = menurow_create(); menurow_add_interaction(src1, variableinteraction_create(&sel_src_amp, "Amp", -0.1, 0.1, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src1);
     MenuRow *src2 = menurow_create(); menurow_add_interaction(src2, variableinteraction_create(&sel_src_freq, "Freq (Hz)", 0.0, 300.0, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src2);
     MenuRow *src3 = menurow_create(); menurow_add_interaction(src3, variableinteraction_create(&sel_src_phase, "Phase (rad)", 0.0, 6.283, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src3);
     MenuRow *src4 = menurow_create(); menurow_add_interaction(src4, variableinteraction_create(&sel_src_radius, "Radius (grid)", 1.0, 50.0, VAR_SLIDER, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src4);
-    MenuRow *src_target = menurow_create(); menurow_add_interaction(src_target, variableinteraction_create(&sel_src_target, "Pressure? ", 0, 1, VAR_BOOL, cb_source_control_changed, NULL)); menu_add_row(m->source_menu, src_target);
+    /* source target: 0=smoke,1=pressure,2=temperature implemented as integer slider */
+    MenuRow *src_target = menurow_create();
+    VariableInteraction *tvi = variableinteraction_create(&sel_src_target, "Target: Smoke", 0.0, 2.0, VAR_SLIDER, on_src_target_slider_change, NULL);
+    variableinteraction_set_step(tvi, 1.0);
+    /* update label dynamically when slider changes isn't supported here; keep default name */
+    menurow_add_interaction(src_target, tvi);
+    menu_add_row(m->source_menu, src_target);
     MenuRow *src5 = menurow_create(); menurow_add_interaction(src5, variableinteraction_create(&sel_src_deselect, "Deselect", 0, 1, VAR_BOOL, cb_deselect_selected_source, NULL)); menu_add_row(m->source_menu, src5);
     MenuRow *src6 = menurow_create(); menurow_add_interaction(src6, variableinteraction_create(&sel_src_delete, "Delete", 0, 1, VAR_BOOL, cb_delete_selected_source, NULL)); menu_add_row(m->source_menu, src6);
 
@@ -616,6 +703,18 @@ static void cb_reset(VariableInteraction *vi, void *user_data) {
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, buf);
         }
+        /* Clear temperature textures as well so Reset resets temperature field */
+        extern GLuint tex_temp; extern GLuint tex_temp_tmp;
+        if (tex_temp) {
+            glBindTexture(GL_TEXTURE_2D, tex_temp);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, buf);
+        }
+        if (tex_temp_tmp) {
+            glBindTexture(GL_TEXTURE_2D, tex_temp_tmp);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, d->nx, d->ny, GL_RGBA, GL_FLOAT, buf);
+        }
         if (tex_velocity_x) {
             glBindTexture(GL_TEXTURE_2D, tex_velocity_x);
             glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -705,10 +804,41 @@ static void cb_dt_changed(VariableInteraction *vi, void *user_data) {
 }
 
 static void cb_clear_sources(VariableInteraction *vi, void *user_data) {
-    (void)user_data; if (vi && vi->variable) *(int*)vi->variable = 0; fprintf(stderr, "Clear sources pressed (no-op)\n");
+    (void)user_data;
+    if (vi && vi->variable) *(int*)vi->variable = 0;
+    /* Clear g_sources array and mark descriptors dirty so GPU sees zero sources */
+    if (g_sources) { free(g_sources); g_sources = NULL; }
+    g_n_sources = 0; g_selected_source = -1; sources_dirty = 1;
+    /* Clear CPU paint buffer and upload zeros to tex_paint_cpu if pointer available */
+    if (paint_buf && g_grid_nx && g_grid_ny) {
+        size_t psize = (size_t)g_grid_nx * g_grid_ny * 4 * sizeof(float);
+        memset(paint_buf, 0, psize);
+        paint_buf_dirty = 0; paint_pending = 0; paint_from_gpu = 0; paint_cpu_uploaded = 0;
+        if (tex_paint_cpu) {
+            glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, g_grid_nx, g_grid_ny, GL_RGBA, GL_FLOAT, paint_buf);
+        }
+    }
+    fprintf(stderr, "Cleared sources and reset paint buffers.\n"); fflush(stderr);
 }
+
 static void cb_clear_barriers(VariableInteraction *vi, void *user_data) {
-    (void)user_data; if (vi && vi->variable) *(int*)vi->variable = 0; fprintf(stderr, "Clear barriers pressed (no-op)\n");
+    (void)user_data;
+    if (vi && vi->variable) *(int*)vi->variable = 0;
+    BoundaryMask *bm = g_bm;
+    if (bm) {
+        GridMetadata *g = bm->grid; if (g) {
+            uint32_t nx = g->dims[0], ny = g->dims[1];
+            /* zero mask and values arrays */
+            if (bm->mask) memset(bm->mask, 0, (size_t)nx * ny);
+            if (bm->values) memset(bm->values, 0, (size_t)nx * ny * sizeof(double));
+            if (bm->types) { for (size_t i=0;i<(size_t)nx*ny;++i) bm->types[i] = BC_DIRICHLET; }
+        }
+        /* upload cleared mask to GPU */
+        boundary_mask_upload(bm, NULL);
+    }
+    fprintf(stderr, "Cleared barriers and uploaded empty mask.\n"); fflush(stderr);
 }
 
 // Simple barrier segment stored in grid indices
@@ -864,6 +994,11 @@ int main(int argc, char **argv) {
     if (add_vs) glDeleteShader(add_vs);
     if (adds_fs) glDeleteShader(adds_fs);
     if (addp_fs) glDeleteShader(addp_fs);
+    /* temperature composite: B channel -> temp texture */
+    const char *add_temp_fs = "#version 120\nuniform sampler2D tgt_tex; uniform sampler2D paint_gpu; uniform sampler2D paint_cpu; void main() { vec2 uv = gl_TexCoord[0].st; float t = texture2D(tgt_tex, uv).r; vec4 pg = texture2D(paint_gpu, uv); vec4 pc = texture2D(paint_cpu, uv); float add = pg.b + pc.b; gl_FragColor = vec4(t + add, 0.0, 0.0, 0.0); }";
+    GLuint addt_fs = compile_shader(GL_FRAGMENT_SHADER, add_temp_fs);
+    if (add_vs && addt_fs) prog_add_paint_temp = link_program(add_vs, addt_fs);
+    if (addt_fs) glDeleteShader(addt_fs);
     if (prog_add_paint_smoke) {
         glUseProgram(prog_add_paint_smoke);
         loc_add_paint_target = glGetUniformLocation(prog_add_paint_smoke, "tgt_tex"); if (loc_add_paint_target >= 0) glUniform1i(loc_add_paint_target, 0);
@@ -879,6 +1014,13 @@ int main(int argc, char **argv) {
         (void)glGetUniformLocation(prog_add_paint_pressure, "paint_cpu"); glUniform1i(glGetUniformLocation(prog_add_paint_pressure, "paint_cpu"), 2);
         glUseProgram(0);
     }
+    if (prog_add_paint_temp) {
+        glUseProgram(prog_add_paint_temp);
+        (void)glGetUniformLocation(prog_add_paint_temp, "tgt_tex"); glUniform1i(glGetUniformLocation(prog_add_paint_temp, "tgt_tex"), 0);
+        (void)glGetUniformLocation(prog_add_paint_temp, "paint_gpu"); glUniform1i(glGetUniformLocation(prog_add_paint_temp, "paint_gpu"), 1);
+        (void)glGetUniformLocation(prog_add_paint_temp, "paint_cpu"); glUniform1i(glGetUniformLocation(prog_add_paint_temp, "paint_cpu"), 2);
+        glUseProgram(0);
+    }
 
     // Prepare initial CPU fields (u_curr with a gaussian source; u_prev zeros)
     double *u_curr_data = calloc((size_t)nx * ny, sizeof(double));
@@ -886,6 +1028,8 @@ int main(int argc, char **argv) {
 
     // Create an empty BoundaryMask; barrier segments will be user-managed
     BoundaryMask *bm = boundary_mask_create(grid);
+    /* expose global pointer for callbacks */
+    g_bm = bm; g_grid_nx = nx; g_grid_ny = ny;
     // barrier segments array (dynamic, starts empty)
     BarrierSeg *barrier_segs = NULL; int n_barrier_segs = 0;
     // initially no barrier segments; user adds via mouse in barrier mode
@@ -962,16 +1106,17 @@ int main(int argc, char **argv) {
     const char *disp_vs = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
     const char *disp_fs =
         "#version 120\n"
-        "uniform sampler2D src_tex; uniform sampler2D vel_tex; uniform sampler2D mask_tex; uniform sampler2D pressure_tex; uniform sampler2D smoke_tex;\n"
+    "uniform sampler2D src_tex; uniform sampler2D vel_tex; uniform sampler2D mask_tex; uniform sampler2D pressure_tex; uniform sampler2D smoke_tex; uniform sampler2D debug_tex; uniform sampler2D temp_tex;\n"
         "uniform ivec2 dims; uniform ivec2 vis_offset; uniform ivec2 vis_size; uniform vec2 spacing; uniform int render_mode; uniform float value_scale; uniform int show_boundaries;\n"
         "void main() { vec2 uv = gl_TexCoord[0].st; vec2 tex_idx = vec2(vis_offset) + uv * vec2(vis_size); vec2 c = (floor(tex_idx) + vec2(0.5)) / vec2(dims); vec3 col = vec3(0.0);\n"
-    " if (render_mode == 1) { vec2 vel = texture2D(vel_tex, c).rg; /* use magnitude (abs) so both directions are visible) */ float ux = vel.x; float uy = vel.y; float rx = sqrt(abs(ux)); float ry = sqrt(abs(uy)); /* scale and compress (non-negative) */ rx = (rx * value_scale) / (1.0 + rx * value_scale); ry = (ry * value_scale) / (1.0 + ry * value_scale); col = vec3(rx, ry, 0.0); }\n"
-    " else if (render_mode == 2) { float p = texture2D(pressure_tex, c).r; float pn = p * value_scale; pn = pn / (1.0 + abs(pn)); col = vec3(pn); }\n"
+    " if (render_mode == 1) { vec2 vel = texture2D(vel_tex, c).rg; float scale_vel = value_scale * 0.1; float ux = vel.x * scale_vel; float uy = vel.y * scale_vel; float sx = ux / (1.0 + abs(ux)); float sy = uy / (1.0 + abs(uy)); vec3 negx = vec3(0.0, 1.0, 0.0); vec3 posx = vec3(1.0, 0.0, 0.0); vec3 colx = (sx > 0.0) ? posx * sx : negx * (-sx); vec3 negy = vec3(0.6, 0.0, 0.6); vec3 posy = vec3(1.0, 1.0, 0.0); vec3 coly = (sy > 0.0) ? posy * sy : negy * (-sy); col = clamp(colx + coly, 0.0, 1.0); }\n"
+    " else if (render_mode == 2) { float p = texture2D(pressure_tex, c).r; float pn = p * value_scale * 50.0; float pcomp = pn / (1.0 + abs(pn)); if (pcomp > 0.0) col = vec3(pcomp, 0.0, 0.0); else col = vec3(0.0, 0.0, -pcomp); }\n"
     " else if (render_mode == 3) { float s = texture2D(smoke_tex, c).r; float sn = s * value_scale; sn = sn / (1.0 + abs(sn)); col = vec3(sn); }\n"
-    " else if (render_mode == 4) { vec2 px = 1.0/vec2(dims); float e_y = texture2D(vel_tex, c + vec2(px.x,0)).y; float w_y = texture2D(vel_tex, c - vec2(px.x,0)).y; float n_x = texture2D(vel_tex, c + vec2(0,px.y)).x; float s_x = texture2D(vel_tex, c - vec2(0,px.y)).x; float dvdx = (e_y - w_y) / (2.0 * spacing.x); float du_dy = (n_x - s_x) / (2.0 * spacing.y); float curl = dvdx - du_dy; float cn = curl * value_scale; /* compress large values for visualization */ float ccomp = cn / (1.0 + abs(cn)); /* map positive->red, negative->blue using absolute magnitude */ if (ccomp > 0.0) col = vec3(abs(ccomp), 0.0, 0.0); else col = vec3(0.0, 0.0, abs(ccomp)); }\n"
-    " else if (render_mode == 5) { /* divergence = du/dx + dv/dy, positive->red, negative->blue */ vec2 px = 1.0/vec2(dims); float ux_e = texture2D(vel_tex, c + vec2(px.x,0)).x; float ux_w = texture2D(vel_tex, c - vec2(px.x,0)).x; float uy_n = texture2D(vel_tex, c + vec2(0,px.y)).y; float uy_s = texture2D(vel_tex, c - vec2(0,px.y)).y; float dudx = (ux_e - ux_w) / (2.0 * spacing.x); float dvdy = (uy_n - uy_s) / (2.0 * spacing.y); float divv = (dudx + dvdy) * value_scale; /* compress */ float dcomp = divv / (1.0 + abs(divv)); if (dcomp > 0.0) col = vec3(dcomp, 0.0, 0.0); else col = vec3(0.0, 0.0, -dcomp); }\n"
-        " if (show_boundaries == 1) { float m = texture2D(mask_tex, c).r; if (m > 0.5) col = vec3(1.0, 0.0, 0.0); }\n"
-        " gl_FragColor = vec4(col, 1.0); }";
+    " else if (render_mode == 4) { vec2 px = 1.0/vec2(dims); float e_y = texture2D(vel_tex, c + vec2(px.x,0)).y; float w_y = texture2D(vel_tex, c - vec2(px.x,0)).y; float n_x = texture2D(vel_tex, c + vec2(0,px.y)).x; float s_x = texture2D(vel_tex, c - vec2(0,px.y)).x; float dvdx = (e_y - w_y) / (2.0 * spacing.x); float du_dy = (n_x - s_x) / (2.0 * spacing.y); float curl = dvdx - du_dy; float cn = curl * (value_scale * 0.1); float ccomp = cn / (1.0 + abs(cn)); if (ccomp > 0.0) col = vec3(abs(ccomp), 0.0, 0.0); else col = vec3(0.0, 0.0, abs(ccomp)); }\n"
+    " else if (render_mode == 5) { vec2 px = 1.0/vec2(dims); float ux_e = texture2D(vel_tex, c + vec2(px.x,0)).x; float ux_w = texture2D(vel_tex, c - vec2(px.x,0)).x; float uy_n = texture2D(vel_tex, c + vec2(0,px.y)).y; float uy_s = texture2D(vel_tex, c - vec2(0,px.y)).y; float dudx = (ux_e - ux_w) / (2.0 * spacing.x); float dvdy = (uy_n - uy_s) / (2.0 * spacing.y); float divv = (dudx + dvdy) * (value_scale * 0.1); float dcomp = divv / (1.0 + abs(divv)); if (dcomp > 0.0) col = vec3(dcomp, 0.0, 0.0); else col = vec3(0.0, 0.0, -dcomp); }\n"
+    " else if (render_mode == 6) { float T = texture2D(temp_tex, c).r; float tn = T * value_scale * 10.0; tn = tn / (1.0 + abs(tn)); col = vec3(tn, 0.0, 0.0); }\n"
+    " if (show_boundaries == 1) { float m = texture2D(mask_tex, c).r; if (m > 0.5) col = vec3(1.0, 0.0, 0.0); }\n"
+    " gl_FragColor = vec4(col, 1.0); }";
     GLuint d_vs = compile_shader(GL_VERTEX_SHADER, disp_vs);
     GLuint d_fs = compile_shader(GL_FRAGMENT_SHADER, disp_fs);
     GLuint disp_prog = 0;
@@ -985,15 +1130,21 @@ int main(int argc, char **argv) {
     GLint loc_disp_mask = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_disp_mask >= 0) glUniform1i(loc_disp_mask, 2);
     GLint loc_disp_pressure = glGetUniformLocation(disp_prog, "pressure_tex"); if (loc_disp_pressure >= 0) glUniform1i(loc_disp_pressure, 3);
     GLint loc_disp_smoke = glGetUniformLocation(disp_prog, "smoke_tex"); if (loc_disp_smoke >= 0) glUniform1i(loc_disp_smoke, 4);
+    GLint loc_disp_debug = glGetUniformLocation(disp_prog, "debug_tex"); if (loc_disp_debug >= 0) glUniform1i(loc_disp_debug, 5);
+    GLint loc_disp_temp = glGetUniformLocation(disp_prog, "temp_tex"); if (loc_disp_temp >= 0) glUniform1i(loc_disp_temp, 6);
     glUseProgram(0);
 
     // Create app/menu state + menus
     AppState app = {0};
-    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; app.dt = 0.002; app.steps_per_frame = 1.0; app.wave_amplitude = 0.002; /* lower default addition amplitude (scaled) */ app.wave_spread = 0.05; app.default_source_frequency = 5.0; app.default_source_phase = 0.0; app.mouse_none = 1; app.show_base_menu = 1; app.show_mouse_controls = 0; app.show_sim_controls = 0; app.max_sim_speed = 1.0; app.limit_fps = 1;
+    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; app.dt = 0.002; app.steps_per_frame = 1.0; app.wave_amplitude = 0.002; /* lower default addition amplitude (scaled) */ app.wave_spread = 0.05; app.default_source_frequency = 5.0; app.default_source_phase = 0.0; app.mouse_none = 1; app.show_base_menu = 1; app.show_mouse_controls = 0; app.show_sim_controls = 0; app.max_sim_speed = 1.0; app.limit_fps = 0;
+    /* Physical defaults */
+    app.viscosity_nu = 1e-5; app.gravity_x = 0.0; app.gravity_y = -9.8; app.temp_kappa = 1e-5;
+    app.buoyancy_beta = 0.002; /* default buoyancy coefficient */
+    app.visc_iters = 20.0; /* reasonable default Jacobi iterations per step */
     /* Pressure solver defaults */
     app.sor_alpha = 1.3; app.sor_iters = 40.0; app.pressure_width = 1.0;
     AppRenderState render = {0};
-    render.mode = RENDER_VELOCITY; render.value_scale = 1.0; render.show_boundaries = 1; render.show_stats = 1; render.mode_velocity = 1; render.mode_pressure = 0; render.mode_smoke = 0; render.mode_vorticity = 0; render.mode_divergence = 0;
+    render.mode = RENDER_VELOCITY; render.value_scale = 1.0; render.show_boundaries = 1; render.show_stats = 1; render.mode_velocity = 1; render.mode_pressure = 0; render.mode_smoke = 0; render.mode_vorticity = 0; render.mode_divergence = 0; render.mode_slider = (double)RENDER_VELOCITY;
 
     // Prepare reset callback data (heap alloc so pointer stays valid). It holds
     // pointers to the texture variables used for ping-pong so the callback
@@ -1010,7 +1161,8 @@ int main(int argc, char **argv) {
     reset_data->wave_expr_ptr = &wave_expr;
     reset_data->grid_ptr = grid;
     reset_data->dt_val = dt;
-    reset_data->app_wave_speed_ptr = &app.wave_speed;
+    /* wave_speed not used here; do not hook callback */
+    reset_data->app_wave_speed_ptr = NULL;
     reset_data->sim_counter_ptr = &sim_step_counter;
 
      /* Initialize source-menu radius default to match mouse paint spread:
@@ -1054,46 +1206,45 @@ int main(int argc, char **argv) {
     /* cached uniform locations for descriptor sampler and max width */
     GLint loc_src_desc = -1, loc_max_src = -1;
     GLint loc_src_gx = -1, loc_src_gy = -1, loc_src_amp = -1, loc_src_freq = -1, loc_src_phase = -1, loc_src_radius = -1;
-    {
-        /* Shader reads source descriptors from a 2-row texture: row 0 = (gx, gy, amp, freq), row 1 = (phase, radius, target, unused) */
-        const char *srcgen_fs =
-            "#version 120\n"
-            "uniform sampler2D src_desc_tex;\n"
-            "uniform int n_sources;\n"
-            "uniform int max_src;\n"
-            "uniform float sim_time; uniform vec2 spacing; uniform ivec2 dims;\n"
-            "void main() { vec2 uv = gl_TexCoord[0].st; vec2 idx = floor(uv * vec2(dims)); float smoke = 0.0; float press = 0.0;\n"
-            " for (int i = 0; i < n_sources; ++i) { float fu = (0.5 + float(i)) / float(max_src); vec4 a = texture2D(src_desc_tex, vec2(fu, 0.25)); vec4 b = texture2D(src_desc_tex, vec2(fu, 0.75)); float gx = a.r; float gy = a.g; float amp = a.b; float freq = a.a; float phase = b.r; float radius = b.g; float target = b.b; float dx = (idx.x - gx) * spacing.x; float dy = (idx.y - gy) * spacing.y; float r2 = dx*dx + dy*dy; float rr = radius * radius * spacing.x * spacing.x; if (r2 <= rr) { float raw = sin(freq * sim_time + phase); /* map from [-1,1] -> [0,2] then scale by amp to get [0,2*amp] */ float v = amp * (1.0 + raw); if (target < 0.5) smoke = v; else press = v; } }\n"
-            " gl_FragColor = vec4(smoke, press, 0.0, 0.0); }";
-        GLuint s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-        GLuint s_fs = compile_shader(GL_FRAGMENT_SHADER, srcgen_fs);
-        if (s_vs && s_fs) srcgen_prog = link_program(s_vs, s_fs);
-        if (s_vs) glDeleteShader(s_vs); if (s_fs) glDeleteShader(s_fs);
-            if (srcgen_prog) {
-            glUseProgram(srcgen_prog);
-            loc_src_n = glGetUniformLocation(srcgen_prog, "n_sources");
-            loc_src_time = glGetUniformLocation(srcgen_prog, "sim_time"); loc_src_dims = glGetUniformLocation(srcgen_prog, "dims"); loc_src_spacing = glGetUniformLocation(srcgen_prog, "spacing");
-            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
-            loc_src_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
-            loc_max_src = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_max_src >= 0) glUniform1i(loc_max_src, 64);
-            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
-            GLint loc_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_desc >= 0) { glUniform1i(loc_desc, 4); }
-            GLint loc_mx = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_mx >= 0) { glUniform1i(loc_mx, 64); }
-            /* create source-descriptor texture (max 64 sources, 2 rows) */
-            glGenTextures(1, &tex_src_desc);
-            glBindTexture(GL_TEXTURE_2D, tex_src_desc);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            /* allocate 64x2 RGBA32F texture, initialize to zero */
-            int max_src = 64;
-            float *zero_buf = calloc((size_t)max_src * 2 * 4, sizeof(float));
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, max_src, 2, 0, GL_RGBA, GL_FLOAT, zero_buf);
-            free(zero_buf);
-            glUseProgram(0);
-        }
+    /* Shader reads source descriptors from a 2-row texture: row 0 = (gx, gy, amp, freq), row 1 = (phase, radius, target, unused)
+        target: 0=smoke, 1=pressure, 2=temperature */
+    const char *srcgen_fs =
+        "#version 120\n"
+        "uniform sampler2D src_desc_tex;\n"
+        "uniform int n_sources;\n"
+        "uniform int max_src;\n"
+        "uniform float sim_time; uniform vec2 spacing; uniform ivec2 dims;\n"
+        "void main() { vec2 uv = gl_TexCoord[0].st; vec2 idx = floor(uv * vec2(dims)); float smoke = 0.0; float press = 0.0; float tempv = 0.0;\n"
+        " for (int i = 0; i < n_sources; ++i) { float fu = (0.5 + float(i)) / float(max_src); vec4 a = texture2D(src_desc_tex, vec2(fu, 0.25)); vec4 b = texture2D(src_desc_tex, vec2(fu, 0.75)); float gx = a.r; float gy = a.g; float amp = a.b; float freq = a.a; float phase = b.r; float radius = b.g; float target = b.b; float dx = (idx.x - gx) * spacing.x; float dy = (idx.y - gy) * spacing.y; float r2 = dx*dx + dy*dy; float rr = radius * radius * spacing.x * spacing.x; if (r2 <= rr) { float raw = sin(freq * sim_time + phase); float v = amp * (1.0 + raw); if (target < 0.5) smoke = v; else if (target < 1.5) press = v; else tempv = v * 10.0; } }\n"
+        " gl_FragColor = vec4(smoke, press, tempv, 0.0); }";
+    GLuint s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint s_fs = compile_shader(GL_FRAGMENT_SHADER, srcgen_fs);
+    if (s_vs && s_fs) srcgen_prog = link_program(s_vs, s_fs);
+    if (s_vs) glDeleteShader(s_vs); if (s_fs) glDeleteShader(s_fs);
+        if (srcgen_prog) {
+        glUseProgram(srcgen_prog);
+        loc_src_n = glGetUniformLocation(srcgen_prog, "n_sources");
+        loc_src_time = glGetUniformLocation(srcgen_prog, "sim_time"); loc_src_dims = glGetUniformLocation(srcgen_prog, "dims"); loc_src_spacing = glGetUniformLocation(srcgen_prog, "spacing");
+        /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
+        loc_src_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
+        loc_max_src = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_max_src >= 0) glUniform1i(loc_max_src, 64);
+        /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
+        GLint loc_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_desc >= 0) { glUniform1i(loc_desc, 4); }
+        GLint loc_mx = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_mx >= 0) { glUniform1i(loc_mx, 64); }
+        /* create source-descriptor texture (max 64 sources, 2 rows) */
+        glGenTextures(1, &tex_src_desc);
+        glBindTexture(GL_TEXTURE_2D, tex_src_desc);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        /* allocate 64x2 RGBA32F texture, initialize to zero */
+        int max_src = 64;
+        float *zero_buf = calloc((size_t)max_src * 2 * 4, sizeof(float));
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, max_src, 2, 0, GL_RGBA, GL_FLOAT, zero_buf);
+        free(zero_buf);
+        glUseProgram(0);
     }
 
      /* Create pressure/velocity/divergence/smoke textures (RGBA32F) */
@@ -1101,141 +1252,136 @@ int main(int argc, char **argv) {
     tex_pressure_tmp = create_empty_texture(nx, ny);
     tex_divergence = create_empty_texture(nx, ny);
     tex_velocity = create_empty_texture(nx, ny);
+    tex_velocity_rhs = create_empty_texture(nx, ny);
     tex_velocity_tmp = create_empty_texture(nx, ny);
     tex_smoke = create_empty_texture(nx, ny);
     tex_smoke_tmp = create_empty_texture(nx, ny);
+    tex_temp = create_empty_texture(nx, ny);
+    tex_temp_tmp = create_empty_texture(nx, ny);
 
-     /* Also create single-channel R textures for vx and vy so compiler-emitted kernels
-         that expect separate samplers can be used without changing the emitter. */
-     tex_velocity_x = create_empty_texture(nx, ny);
-     tex_velocity_y = create_empty_texture(nx, ny);
-     tex_velocity_tmp_x = create_empty_texture(nx, ny);
-     tex_velocity_tmp_y = create_empty_texture(nx, ny);
+    /* Also create single-channel R textures for vx and vy so compiler-emitted kernels
+        that expect separate samplers can be used without changing the emitter. */
+    tex_velocity_x = create_empty_texture(nx, ny);
+    tex_velocity_y = create_empty_texture(nx, ny);
+    tex_velocity_tmp_x = create_empty_texture(nx, ny);
+    tex_velocity_tmp_y = create_empty_texture(nx, ny);
 
-     /* Use bilinear filtering for velocity and smoke textures so semi-Lagrangian
-         backtraces sample smoothly (avoids pixelation and white/flash artifacts). */
-     glBindTexture(GL_TEXTURE_2D, tex_velocity);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-     glBindTexture(GL_TEXTURE_2D, tex_velocity_tmp);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-     glBindTexture(GL_TEXTURE_2D, tex_smoke);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-     glBindTexture(GL_TEXTURE_2D, tex_smoke_tmp);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-     /* pressure may be sampled at non-integer coords for display / projection; linear helps visuals */
-     glBindTexture(GL_TEXTURE_2D, tex_pressure);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-     glBindTexture(GL_TEXTURE_2D, 0);
+    /* Use bilinear filtering for velocity and smoke textures so semi-Lagrangian
+        backtraces sample smoothly (avoids pixelation and white/flash artifacts). */
+    glBindTexture(GL_TEXTURE_2D, tex_velocity);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, tex_velocity_tmp);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, tex_smoke);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, tex_temp);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, tex_smoke_tmp);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    // tex_debug removed
+    /* pressure may be sampled at non-integer coords for display / projection; linear helps visuals */
+    glBindTexture(GL_TEXTURE_2D, tex_pressure);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
     /* Zero-initialize pressure/velocity/smoke textures to avoid garbage on first frame */
-    {
-        size_t pixels = (size_t)nx * ny;
-        float *zero = calloc(pixels * 4, sizeof(float));
-        if (zero) {
-            glBindTexture(GL_TEXTURE_2D, tex_pressure); glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_pressure_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_divergence); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_velocity); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_velocity_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_smoke); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            glBindTexture(GL_TEXTURE_2D, tex_smoke_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
-            free(zero);
-        }
+    size_t pixels = (size_t)nx * ny;
+    float *zero = calloc(pixels * 4, sizeof(float));
+    if (zero) {
+        glBindTexture(GL_TEXTURE_2D, tex_pressure); glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_pressure_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_divergence); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_velocity); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_velocity_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_smoke); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        glBindTexture(GL_TEXTURE_2D, tex_smoke_tmp); glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, zero);
+        free(zero);
     }
 
     /* Insert a small initial pressure pulse at the center for diagnostics (one-shot). We'll write into tex_pressure directly. */
     int diag_pulse_done = 0;
-    {
-        int cx = (int)(nx/2), cy = (int)(ny/2);
-        int pradius = 6;
-        size_t pixels = (size_t)nx * ny;
-        float *tmp = calloc(pixels * 4, sizeof(float));
-        if (tmp) {
-            for (int j = 0; j < (int)ny; ++j) {
-                for (int i = 0; i < (int)nx; ++i) {
-                    int dx = i - cx; int dy = j - cy; if (dx*dx + dy*dy <= pradius*pradius) {
-                        size_t off = ((size_t)j * nx + (size_t)i) * 4;
-                        tmp[off + 0] = 5.0f; /* R channel holds pressure */
-                    }
+    int cx = (int)(nx/2), cy = (int)(ny/2);
+    int pradius = 6;
+    float *tmp = calloc(pixels * 4, sizeof(float));
+    if (tmp) {
+        for (int j = 0; j < (int)ny; ++j) {
+            for (int i = 0; i < (int)nx; ++i) {
+                int dx = i - cx; int dy = j - cy; if (dx*dx + dy*dy <= pradius*pradius) {
+                    size_t off = ((size_t)j * nx + (size_t)i) * 4;
+                    tmp[off + 0] = 5.0f; /* R channel holds pressure */
                 }
             }
-            glBindTexture(GL_TEXTURE_2D, tex_pressure);
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, tmp);
-            free(tmp);
-            diag_pulse_done = 1;
-            fprintf(stderr, "Injected initial pressure pulse at center.\n"); fflush(stderr);
         }
+        glBindTexture(GL_TEXTURE_2D, tex_pressure);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx, ny, GL_RGBA, GL_FLOAT, tmp);
+        free(tmp);
+        diag_pulse_done = 1;
+        fprintf(stderr, "Injected initial pressure pulse at center.\n"); fflush(stderr);
     }
 
-    /* No initial pressure pump: leave pressure texture zero-initialized for clean start */
 
     /* Build divergence expression: div = d(vx)/dx + d(vy)/dy where velocity is stored as variable "vel" with two channels.
        We'll create two derivative expressions for vel.x and vel.y by first extracting components as separate variables
        then using expr_derivative. The compiler expects vector fields as separate variables, so create expr_variable("vx") and expr_variable("vy"). */
-    {
-        Expression *vx = expr_variable("vx");
-        Expression *vy = expr_variable("vy");
-        Expression *dvx_dx = expr_derivative(expr_copy(vx), "x");
-        Expression *dvy_dy = expr_derivative(expr_copy(vy), "y");
-        Expression *div_expr = expr_add(dvx_dx, dvy_dy);
-        GPUProgram *div_prog = gpu_compile_optimized(div_expr, grid, GPU_BACKEND_OPENGL);
-        if (div_prog && div_prog->kernels && div_prog->kernels[0] && div_prog->kernels[0]->source) {
-            const char *src = div_prog->kernels[0]->source;
-            /* Dump the compiled divergence shader source to stderr for inspection */
-            fprintf(stderr, "[GPU DIVERGENCE SHADER SOURCE START]\n%s\n[GPU DIVERGENCE SHADER SOURCE END]\n", src);
-            /* Compile and use the compiler-emitted divergence shader. It expects separate vx_tex/vy_tex samplers. */
-            GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-            GLuint fs = compile_shader(GL_FRAGMENT_SHADER, src);
-            if (vs && fs) {
-                GLuint newp = link_program(vs, fs);
-                if (newp) prog_divergence = newp;
-                glDeleteShader(vs); glDeleteShader(fs);
-            }
-            if (prog_divergence) {
-                glUseProgram(prog_divergence);
-                /* bind component samplers to units 4 and 5 */
-                loc_div_vx = glGetUniformLocation(prog_divergence, "vx_tex"); if (loc_div_vx >= 0) glUniform1i(loc_div_vx, 4);
-                loc_div_vy = glGetUniformLocation(prog_divergence, "vy_tex"); if (loc_div_vy >= 0) glUniform1i(loc_div_vy, 5);
-                /* mask/value samplers follow the project's convention (mask -> unit 2, val -> unit 3) */
-                GLint loc_div_mask = glGetUniformLocation(prog_divergence, "mask_tex"); if (loc_div_mask >= 0) glUniform1i(loc_div_mask, 2);
-                GLint loc_div_val = glGetUniformLocation(prog_divergence, "val_tex"); if (loc_div_val >= 0) glUniform1i(loc_div_val, 3);
-                GLint loc_use_mask = glGetUniformLocation(prog_divergence, "use_mask"); if (loc_use_mask >= 0) glUniform1i(loc_use_mask, 1);
-                loc_div_dims = glGetUniformLocation(prog_divergence, "dims"); if (loc_div_dims >= 0) glUniform2i(loc_div_dims, (GLint)nx, (GLint)ny);
-                loc_div_spacing = glGetUniformLocation(prog_divergence, "spacing"); if (loc_div_spacing >= 0) glUniform2f(loc_div_spacing, (float)spacing[0], (float)spacing[1]);
-                glUseProgram(0);
-            }
+    Expression *vx = expr_variable("vx");
+    Expression *vy = expr_variable("vy");
+    Expression *dvx_dx = expr_derivative(expr_copy(vx), "x");
+    Expression *dvy_dy = expr_derivative(expr_copy(vy), "y");
+    Expression *div_expr = expr_add(dvx_dx, dvy_dy);
+    GPUProgram *div_prog = gpu_compile_optimized(div_expr, grid, GPU_BACKEND_OPENGL);
+    if (div_prog && div_prog->kernels && div_prog->kernels[0] && div_prog->kernels[0]->source) {
+        const char *src = div_prog->kernels[0]->source;
+        /* Dump the compiled divergence shader source to stderr for inspection */
+        fprintf(stderr, "[GPU DIVERGENCE SHADER SOURCE START]\n%s\n[GPU DIVERGENCE SHADER SOURCE END]\n", src);
+        /* Compile and use the compiler-emitted divergence shader. It expects separate vx_tex/vy_tex samplers. */
+        GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint fs = compile_shader(GL_FRAGMENT_SHADER, src);
+        if (vs && fs) {
+            GLuint newp = link_program(vs, fs);
+            if (newp) prog_divergence = newp;
+            glDeleteShader(vs); glDeleteShader(fs);
         }
-        expression_release(div_expr);
-        /* keep div_prog for potential reuse/inspection by higher-level code */
-        if (div_prog) { /* store and let it be freed on exit by gpu_program_free if needed */ }
+        if (prog_divergence) {
+            glUseProgram(prog_divergence);
+            /* bind component samplers to units 4 and 5 */
+            loc_div_vx = glGetUniformLocation(prog_divergence, "vx_tex"); if (loc_div_vx >= 0) glUniform1i(loc_div_vx, 4);
+            loc_div_vy = glGetUniformLocation(prog_divergence, "vy_tex"); if (loc_div_vy >= 0) glUniform1i(loc_div_vy, 5);
+            /* mask/value samplers follow the project's convention (mask -> unit 2, val -> unit 3) */
+            GLint loc_div_mask = glGetUniformLocation(prog_divergence, "mask_tex"); if (loc_div_mask >= 0) glUniform1i(loc_div_mask, 2);
+            GLint loc_div_val = glGetUniformLocation(prog_divergence, "val_tex"); if (loc_div_val >= 0) glUniform1i(loc_div_val, 3);
+            GLint loc_use_mask = glGetUniformLocation(prog_divergence, "use_mask"); if (loc_use_mask >= 0) glUniform1i(loc_use_mask, 1);
+            loc_div_dims = glGetUniformLocation(prog_divergence, "dims"); if (loc_div_dims >= 0) glUniform2i(loc_div_dims, (GLint)nx, (GLint)ny);
+            loc_div_spacing = glGetUniformLocation(prog_divergence, "spacing"); if (loc_div_spacing >= 0) glUniform2f(loc_div_spacing, (float)spacing[0], (float)spacing[1]);
+            glUseProgram(0);
+        }
     }
+    expression_release(div_expr);
 
     /* Compile small extract shaders to fill tex_velocity_x/tex_velocity_y from packed tex_velocity when needed.
        extract_vx: sample vel_tex.r -> output.r
        extract_vy: sample vel_tex.g -> output.r
     */
-    {
-        const char *extract_vs = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-        const char *extract_vx_fs = "#version 120\nuniform sampler2D vel_tex; void main() { vec2 uv = gl_TexCoord[0].st; float v = texture2D(vel_tex, uv).r; gl_FragColor = vec4(v,0.0,0.0,0.0); }";
-        const char *extract_vy_fs = "#version 120\nuniform sampler2D vel_tex; void main() { vec2 uv = gl_TexCoord[0].st; float v = texture2D(vel_tex, uv).g; gl_FragColor = vec4(v,0.0,0.0,0.0); }";
-        GLuint evs = compile_shader(GL_VERTEX_SHADER, extract_vs);
-        GLuint evx = compile_shader(GL_FRAGMENT_SHADER, extract_vx_fs);
-        GLuint evy = compile_shader(GL_FRAGMENT_SHADER, extract_vy_fs);
-        if (evs && evx) { prog_extract_vx = link_program(evs, evx); }
-        if (evs && evy) { prog_extract_vy = link_program(evs, evy); }
-        if (evs) glDeleteShader(evs);
-        if (evx) glDeleteShader(evx);
-        if (evy) glDeleteShader(evy);
-        /* if extraction programs exist, cache their vel_tex uniform units to 0 (we bind tex_velocity at unit 0 before extraction) */
-        if (prog_extract_vx) { glUseProgram(prog_extract_vx); GLint loc = glGetUniformLocation(prog_extract_vx, "vel_tex"); if (loc >= 0) glUniform1i(loc, 0); glUseProgram(0); }
-        if (prog_extract_vy) { glUseProgram(prog_extract_vy); GLint loc = glGetUniformLocation(prog_extract_vy, "vel_tex"); if (loc >= 0) glUniform1i(loc, 0); glUseProgram(0); }
-    }
+    const char *extract_vs = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
+    const char *extract_vx_fs = "#version 120\nuniform sampler2D vel_tex; void main() { vec2 uv = gl_TexCoord[0].st; float v = texture2D(vel_tex, uv).r; gl_FragColor = vec4(v,0.0,0.0,0.0); }";
+    const char *extract_vy_fs = "#version 120\nuniform sampler2D vel_tex; void main() { vec2 uv = gl_TexCoord[0].st; float v = texture2D(vel_tex, uv).g; gl_FragColor = vec4(v,0.0,0.0,0.0); }";
+    GLuint evs = compile_shader(GL_VERTEX_SHADER, extract_vs);
+    GLuint evx = compile_shader(GL_FRAGMENT_SHADER, extract_vx_fs);
+    GLuint evy = compile_shader(GL_FRAGMENT_SHADER, extract_vy_fs);
+    if (evs && evx) { prog_extract_vx = link_program(evs, evx); }
+    if (evs && evy) { prog_extract_vy = link_program(evs, evy); }
+    if (evs) glDeleteShader(evs);
+    if (evx) glDeleteShader(evx);
+    if (evy) glDeleteShader(evy);
+    /* if extraction programs exist, cache their vel_tex uniform units to 0 (we bind tex_velocity at unit 0 before extraction) */
+    if (prog_extract_vx) { glUseProgram(prog_extract_vx); GLint loc = glGetUniformLocation(prog_extract_vx, "vel_tex"); if (loc >= 0) glUniform1i(loc, 0); glUseProgram(0); }
+    if (prog_extract_vy) { glUseProgram(prog_extract_vy); GLint loc = glGetUniformLocation(prog_extract_vy, "vel_tex"); if (loc >= 0) glUniform1i(loc, 0); glUseProgram(0); }
 
     /* Red-Black SOR pressure update shader (u_color = 0 red, 1 black) */
     /* Keep the red-black SOR implementation as a hand-written shader because it requires parity-based updates.
@@ -1286,11 +1432,7 @@ int main(int argc, char **argv) {
         glUseProgram(0);
     }
 
-    /* Projection shader: subtract pressure gradient from velocity */
-    GPUProgram *proj_prog_gpu = NULL;
-    if (/* smoke_proj_expr provided externally when available */ 0) {
-        /* placeholder for expression-based projection */
-    }
+    //Lazy building of projection shader
     if (!prog_project) {
         const char *proj_fs = "#version 120\n"
             "uniform sampler2D vel_tex; uniform sampler2D p_tex; uniform sampler2D mask_tex; uniform sampler2D val_tex;\n"
@@ -1311,6 +1453,7 @@ int main(int argc, char **argv) {
         if (proj_vs && proj_fsh) prog_project = link_program(proj_vs, proj_fsh);
         if (proj_vs) glDeleteShader(proj_vs); if (proj_fsh) glDeleteShader(proj_fsh);
     }
+
     if (prog_project) {
         glUseProgram(prog_project);
         loc_proj_vel = glGetUniformLocation(prog_project, "vel_tex"); if (loc_proj_vel >= 0) glUniform1i(loc_proj_vel, 0);
@@ -1380,15 +1523,11 @@ int main(int argc, char **argv) {
         glUseProgram(0);
     }
 
-    /* Mask smoke: enforce smoke=0 at barrier cells and immediate neighbors to prevent scalar leakage */
+    /* Mask smoke: enforce smoke=0 at barrier cells to prevent scalar leakage into obstacles */
     if (!prog_mask_smoke) {
         const char *mask_smoke_fs = "#version 120\n"
             "uniform sampler2D prev_smoke_tex; uniform sampler2D mask_tex; uniform ivec2 dims;\n"
-            "void main() { vec2 uv = gl_TexCoord[0].st; vec2 px = 1.0/vec2(dims); float s = texture2D(prev_smoke_tex, uv).r;\n"
-            "  float m_c = texture2D(mask_tex, uv).r; float m_l = texture2D(mask_tex, uv - vec2(px.x,0)).r; float m_r = texture2D(mask_tex, uv + vec2(px.x,0)).r;\n"
-            "  float m_n = texture2D(mask_tex, uv + vec2(0,px.y)).r; float m_s = texture2D(mask_tex, uv - vec2(0,px.y)).r;\n"
-            "  if (m_c > 0.5 || m_l > 0.5 || m_r > 0.5 || m_n > 0.5 || m_s > 0.5) s = 0.0;\n"
-            "  gl_FragColor = vec4(s, 0.0, 0.0, 0.0); }\n";
+            "void main() { vec2 uv = gl_TexCoord[0].st; float s = texture2D(prev_smoke_tex, uv).r; float m_c = texture2D(mask_tex, uv).r; if (m_c > 0.5) s = 0.0; gl_FragColor = vec4(s, 0.0, 0.0, 0.0); }\n";
         GLuint mask_vs2 = compile_shader(GL_VERTEX_SHADER, vs_src);
         GLuint mask_smoke_fsh = compile_shader(GL_FRAGMENT_SHADER, mask_smoke_fs);
         if (mask_vs2 && mask_smoke_fsh) prog_mask_smoke = link_program(mask_vs2, mask_smoke_fsh);
@@ -1403,14 +1542,33 @@ int main(int argc, char **argv) {
     }
     /* Keep the smoke advect shader handwritten for now to maintain sampling control and stability. */
     if (!prog_advect_smoke) {
+        /* Boundary-aware semi-Lagrangian: if backward sample lands inside mask, step toward current position to find first fluid sample along backtrace */
         const char *advect_smoke_fs = "#version 120\n"
-            "uniform sampler2D smoke_tex; uniform sampler2D vel_tex; uniform ivec2 dims; uniform vec2 spacing; uniform float dt;\n"
+            "uniform sampler2D smoke_tex; uniform sampler2D vel_tex; uniform sampler2D mask_tex; uniform ivec2 dims; uniform vec2 spacing; uniform float dt; uniform int debug_show_mask;\n"
             "void main(){\n"
             "  vec2 uv = gl_TexCoord[0].st;\n"
             "  vec2 domain = spacing * vec2(dims);\n"
             "  vec2 vel = texture2D(vel_tex, uv).rg;\n"
             "  vec2 prev_pos = uv - dt * vel / domain;\n"
-            "  float s = texture2D(smoke_tex, prev_pos).r;\n"
+            "  float s = 0.0;\n"
+            "  prev_pos = clamp(prev_pos, vec2(0.0), vec2(1.0));\n"
+            "  float m = texture2D(mask_tex, prev_pos).r;\n"
+            "  if (m < 0.5) { s = texture2D(smoke_tex, prev_pos).r; }\n"
+            "  else {\n"
+            "    const int STEPS = 8;\n"
+            "    for (int i = 1; i <= STEPS; ++i) {\n"
+            "      float t = float(i) / float(STEPS);\n"
+            "      vec2 sample_pos = mix(prev_pos, uv, t);\n"
+            "      sample_pos = clamp(sample_pos, vec2(0.0), vec2(1.0));\n"
+            "      float mm = texture2D(mask_tex, sample_pos).r;\n"
+            "      if (mm < 0.5) { s = texture2D(smoke_tex, sample_pos).r; break; }\n"
+            "    }\n"
+            "    if (s == 0.0) s = texture2D(smoke_tex, uv).r;\n"
+            "  }\n"
+            "  if (debug_show_mask != 0) {\n"
+            "    /* visual debug: red = mask at prev_pos, green = mask at current uv, blue = smoke sample */\n"
+            "    float m_prev = texture2D(mask_tex, prev_pos).r; float m_uv = texture2D(mask_tex, uv).r; float s_vis = texture2D(smoke_tex, prev_pos).r;\n"
+            "    gl_FragColor = vec4(m_prev, m_uv, s_vis, 1.0); return; }\n"
             "  gl_FragColor = vec4(s,0,0,0);\n"
             "}\n";
         GLuint advs_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
@@ -1420,11 +1578,128 @@ int main(int argc, char **argv) {
     }
     if (prog_advect_smoke) {
         glUseProgram(prog_advect_smoke);
-    loc_advect_smoke = glGetUniformLocation(prog_advect_smoke, "smoke_tex"); if (loc_advect_smoke >= 0) glUniform1i(loc_advect_smoke, 0);
-    loc_advect_smoke_dims = glGetUniformLocation(prog_advect_smoke, "dims"); if (loc_advect_smoke_dims >= 0) glUniform2i(loc_advect_smoke_dims, (GLint)nx, (GLint)ny);
-    loc_advect_smoke_dt = glGetUniformLocation(prog_advect_smoke, "dt"); loc_advect_smoke_spacing = glGetUniformLocation(prog_advect_smoke, "spacing");
-    loc_advect_smoke_vel = glGetUniformLocation(prog_advect_smoke, "vel_tex"); if (loc_advect_smoke_vel >= 0) glUniform1i(loc_advect_smoke_vel, 1);
+        loc_advect_smoke = glGetUniformLocation(prog_advect_smoke, "smoke_tex"); if (loc_advect_smoke >= 0) glUniform1i(loc_advect_smoke, 0);
+        loc_advect_smoke_dims = glGetUniformLocation(prog_advect_smoke, "dims"); if (loc_advect_smoke_dims >= 0) glUniform2i(loc_advect_smoke_dims, (GLint)nx, (GLint)ny);
+        loc_advect_smoke_dt = glGetUniformLocation(prog_advect_smoke, "dt"); loc_advect_smoke_spacing = glGetUniformLocation(prog_advect_smoke, "spacing");
+        loc_advect_smoke_vel = glGetUniformLocation(prog_advect_smoke, "vel_tex"); if (loc_advect_smoke_vel >= 0) glUniform1i(loc_advect_smoke_vel, 1);
+        loc_advect_smoke_mask = glGetUniformLocation(prog_advect_smoke, "mask_tex"); if (loc_advect_smoke_mask >= 0) glUniform1i(loc_advect_smoke_mask, 2);
+        /* debug uniform to visualize mask sampling at prev_pos/uv; default disabled */
+        // debug_show_mask uniform removed
         glUseProgram(0);
+    }
+
+    /* Temperature advection (semi-Lagrangian, boundary-aware like smoke) */
+    if (!prog_advect_temp) {
+        const char *advect_temp_fs = "#version 120\n"
+            "uniform sampler2D temp_tex; uniform sampler2D vel_tex; uniform sampler2D mask_tex; uniform ivec2 dims; uniform vec2 spacing; uniform float dt;\n"
+            "void main(){ vec2 uv = gl_TexCoord[0].st; vec2 domain = spacing * vec2(dims); vec2 vel = texture2D(vel_tex, uv).rg; vec2 prev_pos = uv - dt * vel / domain; prev_pos = clamp(prev_pos, vec2(0.0), vec2(1.0)); float m = texture2D(mask_tex, prev_pos).r; float tval = 0.0; if (m < 0.5) { tval = texture2D(temp_tex, prev_pos).r; } else { const int STEPS = 8; for (int i=1;i<=STEPS;++i) { float s = float(i)/float(STEPS); vec2 p = mix(prev_pos, uv, s); p = clamp(p, vec2(0.0), vec2(1.0)); float mm = texture2D(mask_tex, p).r; if (mm < 0.5) { tval = texture2D(temp_tex, p).r; break; } } if (tval == 0.0) tval = texture2D(temp_tex, uv).r; } gl_FragColor = vec4(tval,0,0,0); }\n";
+        GLuint advt_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint advt_fsh = compile_shader(GL_FRAGMENT_SHADER, advect_temp_fs);
+        if (advt_vs && advt_fsh) prog_advect_temp = link_program(advt_vs, advt_fsh);
+        if (advt_vs) glDeleteShader(advt_vs); if (advt_fsh) glDeleteShader(advt_fsh);
+    }
+    if (prog_advect_temp) {
+        glUseProgram(prog_advect_temp);
+        loc_advect_temp = glGetUniformLocation(prog_advect_temp, "temp_tex"); if (loc_advect_temp >= 0) glUniform1i(loc_advect_temp, 0);
+        loc_advect_temp_dims = glGetUniformLocation(prog_advect_temp, "dims"); if (loc_advect_temp_dims >= 0) glUniform2i(loc_advect_temp_dims, (GLint)nx, (GLint)ny);
+        loc_advect_temp_dt = glGetUniformLocation(prog_advect_temp, "dt"); loc_advect_temp_spacing = glGetUniformLocation(prog_advect_temp, "spacing");
+        loc_advect_temp_vel = glGetUniformLocation(prog_advect_temp, "vel_tex"); if (loc_advect_temp_vel >= 0) glUniform1i(loc_advect_temp_vel, 1);
+        loc_advect_temp_mask = glGetUniformLocation(prog_advect_temp, "mask_tex"); if (loc_advect_temp_mask >= 0) glUniform1i(loc_advect_temp_mask, 2);
+        glUseProgram(0);
+    }
+
+    /* Buoyancy: compute per-cell force from temperature and add to velocity (simple additive pass) */
+    if (!prog_buoyancy) {
+        const char *buoy_fs = "#version 120\n"
+            "uniform sampler2D vel_tex; uniform sampler2D temp_tex; uniform float beta; uniform float T0; uniform float dt; uniform vec2 gravity; uniform ivec2 dims;\n"
+            "void main(){ vec2 uv = gl_TexCoord[0].st; vec2 v = texture2D(vel_tex, uv).rg; float T = texture2D(temp_tex, uv).r; float b = beta * (T - T0); vec2 force = -b * gravity * dt; v += force; gl_FragColor = vec4(v,0,0); }\n";
+        GLuint b_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint b_fsh = compile_shader(GL_FRAGMENT_SHADER, buoy_fs);
+        if (b_vs && b_fsh) prog_buoyancy = link_program(b_vs, b_fsh);
+        if (b_vs) glDeleteShader(b_vs); if (b_fsh) glDeleteShader(b_fsh);
+    }
+    if (prog_buoyancy) {
+        glUseProgram(prog_buoyancy);
+        loc_buoyancy_temp = glGetUniformLocation(prog_buoyancy, "temp_tex"); if (loc_buoyancy_temp>=0) glUniform1i(loc_buoyancy_temp, 0);
+        loc_buoyancy_vel = glGetUniformLocation(prog_buoyancy, "vel_tex"); if (loc_buoyancy_vel>=0) glUniform1i(loc_buoyancy_vel, 1);
+        loc_buoyancy_beta = glGetUniformLocation(prog_buoyancy, "beta"); loc_buoyancy_T0 = glGetUniformLocation(prog_buoyancy, "T0"); loc_buoyancy_dt = glGetUniformLocation(prog_buoyancy, "dt"); loc_buoyancy_gravity = glGetUniformLocation(prog_buoyancy, "gravity");
+        glUseProgram(0);
+    }
+
+    /* Simple explicit viscosity/diffusion kernels (note: implicit would be better but expensive to add here) */
+    if (!prog_viscosity) {
+        const char *visc_fs = "#version 120\n"
+            "uniform sampler2D vel_tex; uniform ivec2 dims; uniform float nu; uniform float dt; uniform vec2 spacing;\n"
+            "void main(){ vec2 uv = gl_TexCoord[0].st; ivec2 d = dims; vec2 invd = vec2(1.0/d.x,1.0/d.y); float hx = spacing.x, hy = spacing.y; vec2 v = texture2D(vel_tex, uv).rg; vec2 vL = texture2D(vel_tex, uv - vec2(invd.x,0)).rg; vec2 vR = texture2D(vel_tex, uv + vec2(invd.x,0)).rg; vec2 vB = texture2D(vel_tex, uv - vec2(0,invd.y)).rg; vec2 vT = texture2D(vel_tex, uv + vec2(0,invd.y)).rg; vec2 lap = (vL + vR - 2.0*v)/(hx*hx) + (vB + vT - 2.0*v)/(hy*hy); v += nu * dt * lap; gl_FragColor = vec4(v,0,0); }\n";
+        GLuint visc_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint visc_fsh = compile_shader(GL_FRAGMENT_SHADER, visc_fs);
+        if (visc_vs && visc_fsh) prog_viscosity = link_program(visc_vs, visc_fsh);
+        if (visc_vs) glDeleteShader(visc_vs); if (visc_fsh) glDeleteShader(visc_fsh);
+    }
+    if (prog_viscosity) {
+        glUseProgram(prog_viscosity);
+        loc_viscosity_nu = glGetUniformLocation(prog_viscosity, "nu"); loc_viscosity_dt = glGetUniformLocation(prog_viscosity, "dt"); loc_viscosity_dims = glGetUniformLocation(prog_viscosity, "dims"); loc_viscosity_spacing = glGetUniformLocation(prog_viscosity, "spacing");
+        glUseProgram(0);
+    }
+
+    /* Implicit viscosity: red-black Jacobi update for (I - nu*dt*Lap) v_new = v_old
+       The shader updates one parity per invocation: uses uniform 'color' to select red/black.
+       It reads vel_tex (current iterate) and rhs_vel (original advected velocity) and writes updated vel. */
+    if (!prog_visc_jacobi) {
+        const char *visc_jacobi_fs = "#version 120\n"
+            "uniform sampler2D vel_tex; uniform sampler2D rhs_tex; uniform ivec2 dims; uniform vec2 spacing;\n"
+            "uniform float nu; uniform float dt; uniform int color; uniform int use_mask;\n"
+            "void main(){ vec2 uv = gl_TexCoord[0].st; ivec2 d = dims; vec2 px = 1.0/vec2(d); vec2 v = texture2D(vel_tex, uv).rg;\n"
+            "  float vLx = texture2D(vel_tex, uv - vec2(px.x,0)).r; float vRx = texture2D(vel_tex, uv + vec2(px.x,0)).r; float vBx = texture2D(vel_tex, uv - vec2(0,px.y)).r; float vTx = texture2D(vel_tex, uv + vec2(0,px.y)).r;\n"
+            "  float vLy = texture2D(vel_tex, uv - vec2(px.x,0)).g; float vRy = texture2D(vel_tex, uv + vec2(px.x,0)).g; float vBy = texture2D(vel_tex, uv - vec2(0,px.y)).g; float vTy = texture2D(vel_tex, uv + vec2(0,px.y)).g;\n"
+            "  float alpha_x = nu * dt / (spacing.x * spacing.x); float alpha_y = nu * dt / (spacing.y * spacing.y); float denom = 1.0 + 2.0*(alpha_x + alpha_y);\n"
+            "  vec2 idx = floor(uv * vec2(d)); int ix = int(idx.x); int iy = int(idx.y); int parity = int(mod(float(ix+iy), 2.0));\n"
+            "  if (parity != color) { gl_FragColor = vec4(v, 0.0, 0.0); return; }\n"
+            "  vec2 rhs = texture2D(rhs_tex, uv).rg;\n"
+            "  float new_x = (rhs.x + alpha_x*(vLx + vRx) + alpha_y*(vBx + vTx)) / denom;\n"
+            "  float new_y = (rhs.y + alpha_x*(vLy + vRy) + alpha_y*(vBy + vTy)) / denom;\n"
+            "  if (use_mask != 0) { float m = texture2D(rhs_tex, uv).a; if (m > 0.5) { new_x = rhs.x; new_y = rhs.y; } }\n"
+            "  gl_FragColor = vec4(new_x, new_y, 0.0, 0.0); }\n";
+        GLuint vj_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint vj_fsh = compile_shader(GL_FRAGMENT_SHADER, visc_jacobi_fs);
+        if (vj_vs && vj_fsh) prog_visc_jacobi = link_program(vj_vs, vj_fsh);
+        if (vj_vs) glDeleteShader(vj_vs); if (vj_fsh) glDeleteShader(vj_fsh);
+    }
+    if (prog_visc_jacobi) {
+        glUseProgram(prog_visc_jacobi);
+        loc_visc_jacobi_vel = glGetUniformLocation(prog_visc_jacobi, "vel_tex"); if (loc_visc_jacobi_vel >= 0) glUniform1i(loc_visc_jacobi_vel, 0);
+        loc_visc_jacobi_rhs = glGetUniformLocation(prog_visc_jacobi, "rhs_tex"); if (loc_visc_jacobi_rhs >= 0) glUniform1i(loc_visc_jacobi_rhs, 1);
+        loc_visc_jacobi_dims = glGetUniformLocation(prog_visc_jacobi, "dims"); if (loc_visc_jacobi_dims >= 0) glUniform2i(loc_visc_jacobi_dims, (GLint)nx, (GLint)ny);
+        loc_visc_jacobi_spacing = glGetUniformLocation(prog_visc_jacobi, "spacing"); if (loc_visc_jacobi_spacing >= 0) glUniform2f(loc_visc_jacobi_spacing, (float)spacing[0], (float)spacing[1]);
+        loc_visc_jacobi_nu = glGetUniformLocation(prog_visc_jacobi, "nu"); loc_visc_jacobi_dt = glGetUniformLocation(prog_visc_jacobi, "dt"); loc_visc_jacobi_color = glGetUniformLocation(prog_visc_jacobi, "color"); loc_visc_jacobi_use_mask = glGetUniformLocation(prog_visc_jacobi, "use_mask");
+        glUseProgram(0);
+    }
+
+    if (!prog_diffuse_temp) {
+        const char *diff_t_fs = "#version 120\n"
+            "uniform sampler2D temp_tex; uniform ivec2 dims; uniform float kappa; uniform float dt; uniform vec2 spacing;\n"
+            "void main(){ vec2 uv = gl_TexCoord[0].st; ivec2 d = dims; vec2 invd = vec2(1.0/d.x,1.0/d.y); float hx = spacing.x, hy = spacing.y; float t = texture2D(temp_tex, uv).r; float tL = texture2D(temp_tex, uv - vec2(invd.x,0)).r; float tR = texture2D(temp_tex, uv + vec2(invd.x,0)).r; float tB = texture2D(temp_tex, uv - vec2(0,invd.y)).r; float tT = texture2D(temp_tex, uv + vec2(0,invd.y)).r; float lap = (tL + tR - 2.0*t)/(hx*hx) + (tB + tT - 2.0*t)/(hy*hy); t += kappa * dt * lap; gl_FragColor = vec4(t,0,0,0); }\n";
+        GLuint dt_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint dt_fsh = compile_shader(GL_FRAGMENT_SHADER, diff_t_fs);
+        if (dt_vs && dt_fsh) prog_diffuse_temp = link_program(dt_vs, dt_fsh);
+        if (dt_vs) glDeleteShader(dt_vs); if (dt_fsh) glDeleteShader(dt_fsh);
+    }
+    if (prog_diffuse_temp) {
+        glUseProgram(prog_diffuse_temp);
+        loc_diffuse_temp_k = glGetUniformLocation(prog_diffuse_temp, "kappa"); loc_diffuse_temp_dt = glGetUniformLocation(prog_diffuse_temp, "dt"); loc_diffuse_temp_dims = glGetUniformLocation(prog_diffuse_temp, "dims"); loc_diffuse_temp_spacing = glGetUniformLocation(prog_diffuse_temp, "spacing");
+        glUseProgram(0);
+    }
+
+    /* Simple copy shader to duplicate a texture into another (used to set RHS for Jacobi) */
+    GLuint copy_prog = 0;
+    GLint loc_copy_src = -1;
+    {
+        const char *copy_fs = "#version 120\nuniform sampler2D src_tex; void main(){ vec2 uv = gl_TexCoord[0].st; gl_FragColor = texture2D(src_tex, uv); }";
+        GLuint cp_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+        GLuint cp_fs = compile_shader(GL_FRAGMENT_SHADER, copy_fs);
+        if (cp_vs && cp_fs) copy_prog = link_program(cp_vs, cp_fs);
+        if (cp_vs) glDeleteShader(cp_vs); if (cp_fs) glDeleteShader(cp_fs);
+        if (copy_prog) { glUseProgram(copy_prog); loc_copy_src = glGetUniformLocation(copy_prog, "src_tex"); if (loc_copy_src >= 0) glUniform1i(loc_copy_src, 0); glUseProgram(0); }
     }
 
     // Set GL state (window size)
@@ -1527,7 +1802,7 @@ int main(int argc, char **argv) {
                            adds points (pair start/end); right-click deletes the nearest point's pair.
                            Prefer most-recently added closest point when resolving ties. No Y-flip here. */
                         int mx = ev.button.x, my = ev.button.y;
-                        double fx = (double)mx / (double)win_w; double fy = (double)my / (double)win_h; // no flip for barrier mode
+                        double fx = (double)mx / (double)win_w; double fy = 1.0 - (double)my / (double)win_h; // flip for barrier mode to match GL texture orientation
                         int gix = (int)floor(fx * (double)nx_vis) + sponge; if (gix < (int)sponge) gix = sponge; if (gix >= (int)(sponge + nx_vis)) gix = (int)(sponge + nx_vis - 1);
                         int gjy = (int)floor(fy * (double)ny_vis) + sponge; if (gjy < (int)sponge) gjy = sponge; if (gjy >= (int)(sponge + ny_vis)) gjy = (int)(sponge + ny_vis - 1);
 
@@ -1536,20 +1811,20 @@ int main(int argc, char **argv) {
                         const double pick_radius = 12.0; // pixels in window space threshold (increased)
                         for (int s = n_barrier_segs - 1; s >= 0; --s) { // iterate newest-first to prefer recent
                             // endpoint 0
-                            double px0 = (double)(barrier_segs[s].x0 - sponge) / (double)nx_vis * win_w;
-                            double py0 = (double)(barrier_segs[s].y0 - sponge) / (double)ny_vis * win_h;
+                            double px0 = GX_TO_WINX(barrier_segs[s].x0, nx_vis, sponge, win_w);
+                            double py0 = GY_TO_WINY(barrier_segs[s].y0, ny_vis, sponge, win_h);
                             double dx0 = (double)mx - px0; double dy0 = (double)my - py0; double d20 = dx0*dx0 + dy0*dy0;
                             if (d20 < best_d2) { best_d2 = d20; best_seg = s; best_pt = 0; }
                             // endpoint 1
-                            double px1 = (double)(barrier_segs[s].x1 - sponge) / (double)nx_vis * win_w;
-                            double py1 = (double)(barrier_segs[s].y1 - sponge) / (double)ny_vis * win_h;
+                            double px1 = GX_TO_WINX(barrier_segs[s].x1, nx_vis, sponge, win_w);
+                            double py1 = GY_TO_WINY(barrier_segs[s].y1, ny_vis, sponge, win_h);
                             double dx1 = (double)mx - px1; double dy1 = (double)my - py1; double d21 = dx1*dx1 + dy1*dy1;
                             if (d21 < best_d2) { best_d2 = d21; best_seg = s; best_pt = 1; }
                         }
                     } else if (state == SDL_PRESSED && app.mouse_add_barrier_brush) {
                         // Brush paint/clear: immediate effect at click position
                         int mx = ev.button.x, my = ev.button.y;
-                        double fx = (double)mx / (double)win_w; double fy = (double)my / (double)win_h; // no flip for barrier mode
+                        double fx = (double)mx / (double)win_w; double fy = 1.0 - (double)my / (double)win_h; // flip for barrier mode
                         int gix = (int)floor(fx * (double)nx_vis) + sponge; if (gix < (int)sponge) gix = sponge; if (gix >= (int)(sponge + nx_vis)) gix = (int)(sponge + nx_vis - 1);
                         int gjy = (int)floor(fy * (double)ny_vis) + sponge; if (gjy < (int)sponge) gjy = sponge; if (gjy >= (int)(sponge + ny_vis)) gjy = (int)(sponge + ny_vis - 1);
                         int set = (ev.button.button == SDL_BUTTON_LEFT) ? 1 : 0; // left->set barrier, right->clear
@@ -1594,6 +1869,7 @@ int main(int argc, char **argv) {
                                 g_n_sources++;
                                 g_selected_source = idx;
                                 sel_src_amp = g_sources[idx].amp; sel_src_freq = g_sources[idx].freq; sel_src_phase = g_sources[idx].phase; sel_src_radius = g_sources[idx].radius;
+                                sel_src_target = (double)g_sources[idx].target;
                                 // Mark descriptors dirty so GPU gets the new source
                                 sources_dirty = 1;
                                 // Do NOT upload an initial gaussian when creating a source - sources influence the field each frame via paint_buf
@@ -1622,7 +1898,7 @@ int main(int argc, char **argv) {
                             if (barrier_pending) {
                                 // compute release grid coords from current mouse event coordinates
                                 int mx_rel = ev.button.x, my_rel = ev.button.y;
-                                double fx_rel = (double)mx_rel / (double)win_w; double fy_rel = (double)my_rel / (double)win_h; // no flip
+                                double fx_rel = (double)mx_rel / (double)win_w; double fy_rel = 1.0 - (double)my_rel / (double)win_h; // flip to match GL orientation
                                 int gix_rel = (int)floor(fx_rel * (double)nx_vis) + sponge; if (gix_rel < (int)sponge) gix_rel = sponge; if (gix_rel >= (int)(sponge + nx_vis)) gix_rel = (int)(sponge + nx_vis - 1);
                                 int gjy_rel = (int)floor(fy_rel * (double)ny_vis) + sponge; if (gjy_rel < (int)sponge) gjy_rel = sponge; if (gjy_rel >= (int)(sponge + ny_vis)) gjy_rel = (int)(sponge + ny_vis - 1);
                                 if (barrier_pending_x < 0) {
@@ -1646,9 +1922,10 @@ int main(int argc, char **argv) {
                                 // reflect mirror controls for selected source
                                 if (g_selected_source >= 0 && g_selected_source < g_n_sources) {
                                     sel_src_amp = g_sources[g_selected_source].amp;
-                                    sel_src_freq = g_sources[g_selected_source].freq;
-                                    sel_src_phase = g_sources[g_selected_source].phase;
-                                    sel_src_radius = g_sources[g_selected_source].radius;
+                                        sel_src_freq = g_sources[g_selected_source].freq;
+                                        sel_src_phase = g_sources[g_selected_source].phase;
+                                        sel_src_radius = g_sources[g_selected_source].radius;
+                                        sel_src_target = (double)g_sources[g_selected_source].target;
                                 }
                             } else if (source_drag_candidate) {
                                 // Candidate click without moving: toggle selection of that source
@@ -1704,7 +1981,7 @@ int main(int argc, char **argv) {
                     }
                     if (barrier_drag_active) {
                         // Update dragged endpoint position based on mouse motion
-                        double fx = (double)mx / (double)win_w; double fy = (double)my / (double)win_h; // no flip
+                        double fx = (double)mx / (double)win_w; double fy = 1.0 - (double)my / (double)win_h; // flip
                         int gix = (int)floor(fx * (double)nx_vis) + sponge; if (gix < (int)sponge) gix = sponge; if (gix >= (int)(sponge + nx_vis)) gix = (int)(sponge + nx_vis - 1);
                         int gjy = (int)floor(fy * (double)ny_vis) + sponge; if (gjy < (int)sponge) gjy = sponge; if (gjy >= (int)(sponge + ny_vis)) gjy = (int)(sponge + ny_vis - 1);
                         if (barrier_drag_seg >= 0 && barrier_drag_seg < n_barrier_segs) {
@@ -1718,7 +1995,7 @@ int main(int argc, char **argv) {
                     int left_down = btnstate & SDL_BUTTON(SDL_BUTTON_LEFT);
                     int right_down = btnstate & SDL_BUTTON(SDL_BUTTON_RIGHT);
                     if (left_down || right_down) {
-                        double fx = (double)mx / (double)win_w; double fy = (double)my / (double)win_h; // no flip
+                        double fx = (double)mx / (double)win_w; double fy = 1.0 - (double)my / (double)win_h; // flip
                         int gix = (int)floor(fx * (double)nx_vis) + sponge; if (gix < (int)sponge) gix = sponge; if (gix >= (int)(sponge + nx_vis)) gix = (int)(sponge + nx_vis - 1);
                         int gjy = (int)floor(fy * (double)ny_vis) + sponge; if (gjy < (int)sponge) gjy = sponge; if (gjy >= (int)(sponge + ny_vis)) gjy = (int)(sponge + ny_vis - 1);
                         int set = left_down ? 1 : 0;
@@ -1808,7 +2085,9 @@ int main(int argc, char **argv) {
                         glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, tex_src_desc);
                         if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
                         glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        /* Clear to black for source generation render target. */
+                        glClearColor(0, 0, 0, 0);
+                        glClear(GL_COLOR_BUFFER_BIT);
                         draw_fullscreen_quad(); glFlush();
                         paint_pending = 1;
                         paint_from_gpu = 1;
@@ -1887,6 +2166,22 @@ int main(int argc, char **argv) {
                               { GLuint ttmp = tex_pressure; tex_pressure = tex_pressure_tmp; tex_pressure_tmp = ttmp; }
                               /* Debug: report min/max/NaN on pressure to help diagnose spikes */
                           }
+                         if (prog_add_paint_temp) {
+                              /* render into tmp temperature texture, sampling current temp + paints (B channel) */
+                              glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                              glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_temp_tmp, 0);
+                              if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                                  glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                                  glUseProgram(prog_add_paint_temp);
+                                  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_temp); /* input */
+                                  glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_paint);
+                                  glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
+                                  draw_fullscreen_quad(); glFlush();
+                              }
+                              glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                              glViewport(0,0,win_w,win_h);
+                              { GLuint ttmp = tex_temp; tex_temp = tex_temp_tmp; tex_temp_tmp = ttmp; }
+                          }
                           /* clear CPU paint buffer and upload zeros to cpu paint texture so
                               CPU additions are applied only once (until user paints again) */
                           size_t psize = (size_t)nx * ny * 4 * sizeof(float);
@@ -1960,31 +2255,30 @@ int main(int argc, char **argv) {
                 tex_u_curr = tex_out;
                 tex_out = tex_prev;
 
-                /* Damping removed: no sponge pass */
                 // increment sim counter for each physics step performed
                 sim_step_counter++;
                 /* --- pressure/divergence/velocity/smoke pipeline reordered: divergence/solve/project moved after velocity advection --- */
 
-                    // 3.5) Mask velocity against barriers: zero orthogonal components around barrier cells
-                    if (prog_mask_velocity) {
-                        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_tmp, 0);
-                        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
-                            glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
-                            glUseProgram(prog_mask_velocity);
-                            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* prev vel */
-                            glActiveTexture(GL_TEXTURE1); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
-                            if (loc_mask_prevvel >= 0) glUniform1i(loc_mask_prevvel, 0);
-                            if (loc_mask_mask >= 0) glUniform1i(loc_mask_mask, 1);
-                            if (loc_mask_dims >= 0) glUniform2i(loc_mask_dims, (GLint)nx, (GLint)ny);
-                            glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                            glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-                            draw_fullscreen_quad(); glFlush();
-                        }
-                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                        glViewport(0,0,win_w,win_h);
-                        { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
+                // 3.5) Mask velocity against barriers: zero orthogonal components around barrier cells
+                if (prog_mask_velocity) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_tmp, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(prog_mask_velocity);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* prev vel */
+                        glActiveTexture(GL_TEXTURE1); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
+                        if (loc_mask_prevvel >= 0) glUniform1i(loc_mask_prevvel, 0);
+                        if (loc_mask_mask >= 0) glUniform1i(loc_mask_mask, 1);
+                        if (loc_mask_dims >= 0) glUniform2i(loc_mask_dims, (GLint)nx, (GLint)ny);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
                     }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
+                }
 
                 // 4) Advect velocity semi-Lagrangian
                 if (prog_advect_velocity) {
@@ -2116,7 +2410,80 @@ int main(int argc, char **argv) {
                     { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
                 }
 
+                /* Re-apply velocity mask after projection so the final velocity field
+                 * used for smoke advection has orthogonal components zeroed near barriers. */
+                if (prog_mask_velocity) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_tmp, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(prog_mask_velocity);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* prev vel */
+                        glActiveTexture(GL_TEXTURE1); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
+                        if (loc_mask_prevvel >= 0) glUniform1i(loc_mask_prevvel, 0);
+                        if (loc_mask_mask >= 0) glUniform1i(loc_mask_mask, 1);
+                        if (loc_mask_dims >= 0) glUniform2i(loc_mask_dims, (GLint)nx, (GLint)ny);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
+                }
+
+                /* Periodic debug readback: compute average kinetic energy and max velocity magnitude
+                   every ke_readback_interval simulation steps. Controlled by debug_per_stage. */
+                const int ke_readback_interval = 60; /* steps between readbacks */
+                if (debug_per_stage && (ke_readback_interval > 0) && ((int)(sim_step_counter % ke_readback_interval) == 0)) {
+                    size_t pixels = (size_t)nx * (size_t)ny;
+                    float *vbuf = (float*)malloc(pixels * 4 * sizeof(float));
+                    if (vbuf) {
+                        glBindTexture(GL_TEXTURE_2D, tex_velocity);
+                        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, vbuf);
+                        double sum_ke = 0.0; double maxm = 0.0; size_t nan_count = 0;
+                        for (size_t pi = 0; pi < pixels; ++pi) {
+                            double vx = vbuf[pi*4 + 0]; double vy = vbuf[pi*4 + 1];
+                            double mag2 = vx*vx + vy*vy;
+                            if (!(mag2 == mag2)) { nan_count++; continue; }
+                            sum_ke += 0.5 * mag2; /* per-cell kinetic energy (unit mass) */
+                            if (mag2 > maxm*maxm) maxm = sqrt(mag2);
+                        }
+                        double mean_ke = sum_ke / (double)pixels;
+                        fprintf(stderr, "DEBUG KE: step=%llu mean_ke=%g max_vel=%g nan_count=%zu\n", (unsigned long long)sim_step_counter, mean_ke, maxm, nan_count);
+                        fflush(stderr);
+                        free(vbuf);
+                    } else {
+                        fprintf(stderr, "DEBUG: failed to allocate velocity readback buffer (%zu bytes)\n", pixels * 4 * sizeof(float)); fflush(stderr);
+                    }
+                }
+
                 // 5) Advect smoke (if enabled)
+                /* Advect temperature (same boundary-aware SL as smoke) */
+                if (prog_advect_temp) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_temp_tmp, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(prog_advect_temp);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_temp);
+                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity);
+                        glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
+                        if (loc_advect_temp >= 0) glUniform1i(loc_advect_temp, 0);
+                        if (loc_advect_temp_vel >= 0) glUniform1i(loc_advect_temp_vel, 1);
+                        if (loc_advect_temp_mask >= 0) glUniform1i(loc_advect_temp_mask, 2);
+                        if (loc_advect_temp_dims >= 0) glUniform2i(loc_advect_temp_dims, (GLint)nx, (GLint)ny);
+                        if (loc_advect_temp_dt >= 0) glUniform1f(loc_advect_temp_dt, (float)dt);
+                        if (loc_advect_temp_spacing >= 0) glUniform2f(loc_advect_temp_spacing, (float)spacing[0], (float)spacing[1]);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    { GLuint ttmp = tex_temp; tex_temp = tex_temp_tmp; tex_temp_tmp = ttmp; }
+                }
+
                 if (prog_advect_smoke) {
                     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
                     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_smoke_tmp, 0);
@@ -2125,8 +2492,10 @@ int main(int argc, char **argv) {
                         glUseProgram(prog_advect_smoke);
                         glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_smoke);
                         glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity);
+                        glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
                         if (loc_advect_smoke >= 0) glUniform1i(loc_advect_smoke, 0);
                         if (loc_advect_smoke_vel >= 0) glUniform1i(loc_advect_smoke_vel, 1);
+                        if (loc_advect_smoke_mask >= 0) glUniform1i(loc_advect_smoke_mask, 2);
                         if (loc_advect_smoke_dims >= 0) glUniform2i(loc_advect_smoke_dims, (GLint)nx, (GLint)ny);
                         if (loc_advect_smoke_dt >= 0) glUniform1f(loc_advect_smoke_dt, (float)dt);
                         if (loc_advect_smoke_spacing >= 0) glUniform2f(loc_advect_smoke_spacing, (float)spacing[0], (float)spacing[1]);
@@ -2136,15 +2505,14 @@ int main(int argc, char **argv) {
                     }
                     glBindFramebuffer(GL_FRAMEBUFFER, 0);
                     glViewport(0,0,win_w,win_h);
-                    { GLuint ttmp = tex_smoke; tex_smoke = tex_smoke_tmp; tex_smoke_tmp = ttmp; }
                     /* Mask smoke so barrier cells and their immediate neighbors are forced to zero */
                     if (prog_mask_smoke) {
                         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_smoke_tmp, 0);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_smoke, 0);
                         if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
                             glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
                             glUseProgram(prog_mask_smoke);
-                            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_smoke);
+                            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_smoke_tmp);
                             glActiveTexture(GL_TEXTURE1); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
                             if (loc_mask_smoke_prev >= 0) glUniform1i(loc_mask_smoke_prev, 0);
                             if (loc_mask_smoke_mask >= 0) glUniform1i(loc_mask_smoke_mask, 1);
@@ -2155,8 +2523,98 @@ int main(int argc, char **argv) {
                         }
                         glBindFramebuffer(GL_FRAMEBUFFER, 0);
                         glViewport(0,0,win_w,win_h);
-                        { GLuint ttmp = tex_smoke; tex_smoke = tex_smoke_tmp; tex_smoke_tmp = ttmp; }
                     }
+                }
+
+                /* Apply buoyancy force to velocity: reads temperature and velocity, writes vel_tmp */
+                if (prog_buoyancy) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_tmp, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(prog_buoyancy);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_temp);
+                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity);
+                        if (loc_buoyancy_temp >= 0) glUniform1i(loc_buoyancy_temp, 0);
+                        if (loc_buoyancy_vel >= 0) glUniform1i(loc_buoyancy_vel, 1);
+                        if (loc_buoyancy_beta >= 0) glUniform1f(loc_buoyancy_beta, (float)app.buoyancy_beta);
+                        if (loc_buoyancy_T0 >= 0) glUniform1f(loc_buoyancy_T0, 0.0f);
+                        if (loc_buoyancy_dt >= 0) glUniform1f(loc_buoyancy_dt, (float)dt);
+                        if (loc_buoyancy_gravity >= 0) glUniform2f(loc_buoyancy_gravity, (float)app.gravity_x, (float)app.gravity_y);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
+                }
+
+                /* Implicit viscosity: solve (I - nu*dt*Lap) v_new = v_old using red-black Jacobi iterations.
+                We copy the current velocity into tex_velocity_rhs (rhs) once, then perform N iterations
+                ping-ponging tex_velocity <-> tex_velocity_tmp using prog_visc_jacobi. The RHS is bound as unit 1. */
+                if (prog_visc_jacobi && app.viscosity_nu > 0.0 && app.visc_iters >= 1.0) {
+                    int iters = (int)lround(app.visc_iters);
+                    /* copy current velocity into rhs texture */
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_rhs, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(copy_prog);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_velocity);
+                        if (loc_copy_src >= 0) glUniform1i(loc_copy_src, 0);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    /* perform red-black jacobi iterations */
+                    for (int it = 0; it < iters; ++it) {
+                        int color = it & 1;
+                        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_velocity_tmp, 0);
+                        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                            glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                            glUseProgram(prog_visc_jacobi);
+                            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* current iterate */
+                            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity_rhs); /* rhs */
+                            if (loc_visc_jacobi_vel >= 0) glUniform1i(loc_visc_jacobi_vel, 0);
+                            if (loc_visc_jacobi_dims >= 0) glUniform2i(loc_visc_jacobi_dims, (GLint)nx, (GLint)ny);
+                            if (loc_visc_jacobi_spacing >= 0) glUniform2f(loc_visc_jacobi_spacing, (float)spacing[0], (float)spacing[1]);
+                            if (loc_visc_jacobi_nu >= 0) glUniform1f(loc_visc_jacobi_nu, (float)app.viscosity_nu);
+                            if (loc_visc_jacobi_dt >= 0) glUniform1f(loc_visc_jacobi_dt, (float)dt);
+                            if (loc_visc_jacobi_color >= 0) glUniform1i(loc_visc_jacobi_color, color);
+                            if (loc_visc_jacobi_use_mask >= 0) glUniform1i(loc_visc_jacobi_use_mask, bm ? 1 : 0);
+                            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                            glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                            draw_fullscreen_quad(); glFlush();
+                        }
+                        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                        glViewport(0,0,win_w,win_h);
+                        { GLuint ttmp = tex_velocity; tex_velocity = tex_velocity_tmp; tex_velocity_tmp = ttmp; }
+                    }
+                }
+
+        /* Diffuse temperature (explicit) */
+        if (prog_diffuse_temp && app.temp_kappa > 0.0) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_temp_tmp, 0);
+                    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                        glViewport(0,0,(GLsizei)nx,(GLsizei)ny);
+                        glUseProgram(prog_diffuse_temp);
+                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_temp);
+            if (loc_diffuse_temp_k >= 0) glUniform1f(loc_diffuse_temp_k, (float)app.temp_kappa);
+            if (loc_diffuse_temp_dt >= 0) glUniform1f(loc_diffuse_temp_dt, (float)dt);
+            if (loc_diffuse_temp_dims >= 0) glUniform2i(loc_diffuse_temp_dims, (GLint)nx, (GLint)ny);
+            if (loc_diffuse_temp_spacing >= 0) glUniform2f(loc_diffuse_temp_spacing, (float)spacing[0], (float)spacing[1]);
+                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                        draw_fullscreen_quad(); glFlush();
+                    }
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glViewport(0,0,win_w,win_h);
+                    { GLuint ttmp = tex_temp; tex_temp = tex_temp_tmp; tex_temp_tmp = ttmp; }
                 }
                 /* --- End pressure/divergence/velocity/smoke pipeline --- */
             } // end steps_per_frame loop
@@ -2167,26 +2625,28 @@ int main(int argc, char **argv) {
         glViewport(0,0,win_w,win_h);
 
         // Render current field to screen using unified display shader
-    glUseProgram(disp_prog);
-    /* bind textures to fixed units expected by shader */
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr); /* src */
-    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* vel */
-    glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
-    glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, tex_pressure);
-    glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, tex_smoke);
-    GLint loc_src = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src>=0) glUniform1i(loc_src, 0);
-    GLint loc_vel = glGetUniformLocation(disp_prog, "vel_tex"); if (loc_vel>=0) glUniform1i(loc_vel, 1);
-    GLint loc_maskd = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_maskd>=0) glUniform1i(loc_maskd, 2);
-    GLint loc_ptex = glGetUniformLocation(disp_prog, "pressure_tex"); if (loc_ptex>=0) glUniform1i(loc_ptex, 3);
-    GLint loc_stex = glGetUniformLocation(disp_prog, "smoke_tex"); if (loc_stex>=0) glUniform1i(loc_stex, 4);
-    GLint loc_mode = glGetUniformLocation(disp_prog, "render_mode"); if (loc_mode>=0) glUniform1i(loc_mode, render.mode);
-    GLint loc_vscl = glGetUniformLocation(disp_prog, "value_scale"); if (loc_vscl>=0) glUniform1f(loc_vscl, (float)render.value_scale);
-    GLint loc_dims_disp = glGetUniformLocation(disp_prog, "dims"); if (loc_dims_disp>=0) glUniform2i(loc_dims_disp, (GLint)nx, (GLint)ny);
-    GLint loc_vis_off_disp = glGetUniformLocation(disp_prog, "vis_offset"); if (loc_vis_off_disp>=0) glUniform2i(loc_vis_off_disp, 0, 0);
-    GLint loc_vis_size_disp = glGetUniformLocation(disp_prog, "vis_size"); if (loc_vis_size_disp>=0) glUniform2i(loc_vis_size_disp, (GLint)nx_vis, (GLint)ny_vis);
-    GLint loc_spacing_disp = glGetUniformLocation(disp_prog, "spacing"); if (loc_spacing_disp>=0) glUniform2f(loc_spacing_disp, (float)spacing[0], (float)spacing[1]);
-    GLint loc_view_px = glGetUniformLocation(disp_prog, "view_px"); if (loc_view_px>=0) glUniform2f(loc_view_px, (float)win_w, (float)win_h);
-    GLint loc_show_bound = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound>=0) glUniform1i(loc_show_bound, render.show_boundaries ? 1 : 0);
+        glUseProgram(disp_prog);
+        /* bind textures to fixed units expected by shader */
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr); /* src */
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_velocity); /* vel */
+        glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex); else glBindTexture(GL_TEXTURE_2D, 0);
+        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, tex_pressure);
+        glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, tex_smoke);
+    glActiveTexture(GL_TEXTURE6); glBindTexture(GL_TEXTURE_2D, tex_temp);
+        GLint loc_src = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src>=0) glUniform1i(loc_src, 0);
+        GLint loc_vel = glGetUniformLocation(disp_prog, "vel_tex"); if (loc_vel>=0) glUniform1i(loc_vel, 1);
+        GLint loc_maskd = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_maskd>=0) glUniform1i(loc_maskd, 2);
+        GLint loc_ptex = glGetUniformLocation(disp_prog, "pressure_tex"); if (loc_ptex>=0) glUniform1i(loc_ptex, 3);
+        GLint loc_stex = glGetUniformLocation(disp_prog, "smoke_tex"); if (loc_stex>=0) glUniform1i(loc_stex, 4);
+    GLint loc_ttex = glGetUniformLocation(disp_prog, "temp_tex"); if (loc_ttex>=0) glUniform1i(loc_ttex, 6);
+        GLint loc_mode = glGetUniformLocation(disp_prog, "render_mode"); if (loc_mode>=0) glUniform1i(loc_mode, render.mode);
+        GLint loc_vscl = glGetUniformLocation(disp_prog, "value_scale"); if (loc_vscl>=0) glUniform1f(loc_vscl, (float)render.value_scale);
+        GLint loc_dims_disp = glGetUniformLocation(disp_prog, "dims"); if (loc_dims_disp>=0) glUniform2i(loc_dims_disp, (GLint)nx, (GLint)ny);
+        GLint loc_vis_off_disp = glGetUniformLocation(disp_prog, "vis_offset"); if (loc_vis_off_disp>=0) glUniform2i(loc_vis_off_disp, 0, 0);
+        GLint loc_vis_size_disp = glGetUniformLocation(disp_prog, "vis_size"); if (loc_vis_size_disp>=0) glUniform2i(loc_vis_size_disp, (GLint)nx_vis, (GLint)ny_vis);
+        GLint loc_spacing_disp = glGetUniformLocation(disp_prog, "spacing"); if (loc_spacing_disp>=0) glUniform2f(loc_spacing_disp, (float)spacing[0], (float)spacing[1]);
+        GLint loc_view_px = glGetUniformLocation(disp_prog, "view_px"); if (loc_view_px>=0) glUniform2f(loc_view_px, (float)win_w, (float)win_h);
+        GLint loc_show_bound = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound>=0) glUniform1i(loc_show_bound, render.show_boundaries ? 1 : 0);
         glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
         draw_fullscreen_quad();
         // Unbind any GL program so menu uses fixed-function pipeline rendering
