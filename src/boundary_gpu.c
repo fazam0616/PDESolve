@@ -27,6 +27,8 @@ BoundaryMask* boundary_mask_create(GridMetadata *grid) {
     // Populate axis-aligned mask values immediately so CPU-side code that
     // creates a BoundaryMask can use it without requiring a GL context.
     populate_axis_aligned(bm);
+    bm->dirty = 1;    /* textures not yet uploaded */
+    bm->uploaded = 0;
     return bm;
 }
 
@@ -68,12 +70,12 @@ static void populate_axis_aligned(BoundaryMask *bm) {
 static GLuint create_texture_from_mask(BoundaryMask *bm) {
     uint32_t nx = bm->grid->dims[0]; uint32_t ny = bm->grid->dims[1];
     unsigned char *buf = calloc(nx * ny * 4, 1);
-    for (uint32_t j = 0; j < ny; ++j) {
+    for (uint32_t j_gl = 0; j_gl < ny; ++j_gl) {
+        uint32_t src_j = ny - 1 - j_gl; /* Y-flip: matches kernel_upload_input for field textures */
         for (uint32_t i = 0; i < nx; ++i) {
-            /* Use direct (i,j) ordering so texture upload matches shader UV coordinates (no Y-flip) */
-            size_t off = (size_t)i * ny + j;
+            size_t off = (size_t)i * ny + src_j;
             uint8_t m = bm->mask[off];
-            size_t idx = ((size_t)j * nx + i) * 4;
+            size_t idx = ((size_t)j_gl * nx + i) * 4;
             buf[idx+0] = m ? 255 : 0;
             buf[idx+1] = buf[idx+2] = buf[idx+3] = 0;
         }
@@ -90,12 +92,12 @@ static GLuint create_texture_from_mask(BoundaryMask *bm) {
 static GLuint create_texture_from_values(BoundaryMask *bm) {
     uint32_t nx = bm->grid->dims[0]; uint32_t ny = bm->grid->dims[1];
     float *buf = calloc(nx * ny * 4, sizeof(float));
-    for (uint32_t j = 0; j < ny; ++j) {
+    for (uint32_t j_gl = 0; j_gl < ny; ++j_gl) {
+        uint32_t src_j = ny - 1 - j_gl; /* Y-flip: matches kernel_upload_input for field textures */
         for (uint32_t i = 0; i < nx; ++i) {
-            /* Use direct (i,j) ordering so texture upload matches shader UV coordinates (no Y-flip) */
-            size_t off = (size_t)i * ny + j;
+            size_t off = (size_t)i * ny + src_j;
             double v = bm->values[off];
-            size_t idx = ((size_t)j * nx + i) * 4;
+            size_t idx = ((size_t)j_gl * nx + i) * 4;
             buf[idx+0] = (float)v;
         }
     }
@@ -111,12 +113,16 @@ static GLuint create_texture_from_values(BoundaryMask *bm) {
 int boundary_mask_upload(BoundaryMask *bm, GPUContext *ctx) {
     (void)ctx;
     if (!bm) return 1;
-    // populate axis-aligned boundaries if not already set
-    populate_axis_aligned(bm);
+    /* Do NOT call populate_axis_aligned here – it was already called in
+       boundary_mask_create. Only re-populate if the caller has explicitly
+       dirtied the mask (bm->dirty == 1). The dirty flag is set by create and
+       by any future helper that modifies mask/values CPU-side. */
     if (bm->mask_tex) glDeleteTextures(1, &bm->mask_tex);
     if (bm->values_tex) glDeleteTextures(1, &bm->values_tex);
-    bm->mask_tex = create_texture_from_mask(bm);
+    bm->mask_tex   = create_texture_from_mask(bm);
     bm->values_tex = create_texture_from_values(bm);
+    bm->uploaded = 1;
+    bm->dirty    = 0;
     return 0;
 }
 

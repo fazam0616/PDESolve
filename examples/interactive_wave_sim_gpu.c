@@ -19,6 +19,7 @@
 #include <SDL2/SDL_opengl.h>
 
 #include "../include/gpu_compiler.h"
+#include "../include/gpu_sim.h"
 #include "../include/grid.h"
 #include "../include/expression.h"
 #include "../include/boundary_gpu.h"
@@ -522,6 +523,10 @@ static void cb_wave_speed_changed(VariableInteraction *vi, void *user_data) {
     }
     // store new GPUProgram pointer
     if (d->gpu_prog_ptr) *(d->gpu_prog_ptr) = prog_new;
+    /* The new prog_new's kernel will be compiled lazily on the next
+       gpu_run_program_to_tex call.  Clear the old compute_prog handle
+       if one was set (it's NULL after the refactor).                    */
+    if (d->compute_prog_ptr && *(d->compute_prog_ptr)) { glDeleteProgram(*(d->compute_prog_ptr)); *(d->compute_prog_ptr) = 0; }
     // free the temporary expression (release a ref; GPUProgram retained one)
     expression_release(wave_expr_new);
 }
@@ -586,6 +591,328 @@ static void rebuild_barrier_mask(BoundaryMask *bm, BarrierSeg *segs, int nseg) {
     }
 }
 
+/* -----------------------------------------------------------------------
+ * WaveSimGPU — holds all GPU objects created during initialisation so
+ * they can be passed around as a unit and freed together.
+ * ----------------------------------------------------------------------- */
+typedef struct {
+    GPUContext      *gpu_ctx;
+    GPUTexDict      *compute_tex_dict;
+    GPUProgram      *paint_gpu_prog;
+    GPUTexDict      *paint_tex_dict;
+    GPUProgram      *damping_gpu_prog;
+    GPUTexDict      *damping_tex_dict;
+    GLuint           damping_tex;
+    GLuint           overlay_prog;
+    GLint            loc_ov_mask, loc_ov_dims, loc_ov_vis_off, loc_ov_vis_size;
+    GPUProgram      *disp_prog_gpu;
+    GLuint           disp_prog;
+    GPURenderConfig *disp_rc;
+    GLuint           srcgen_prog;
+    GLint            loc_src_n, loc_src_time, loc_src_dims, loc_src_spacing;
+    GLint            loc_src_desc, loc_max_src;
+    GPUProgram      *compute_prog;   /* wave update program */
+    Expression      *wave_expr;      /* current wave expression (kept for cb_wave_speed_changed) */
+} WaveSimGPU;
+
+/* Initialise all GPU programs/texdicts/rendercfg that live for the duration
+ * of the simulation.  Must be called after the OpenGL context is current.
+ * Returns 0 on success, -1 on failure (partial state may have been created;
+ * caller should call wave_sim_gpu_free even on failure).
+ *
+ * render must already be initialised before this call because disp_rc
+ * stores pointers into its fields for per-frame uniform updates.
+ */
+static int wave_sim_gpu_init(WaveSimGPU *g,
+                              SDL_Window *win, SDL_GLContext ctx,
+                              uint32_t nx, uint32_t ny,
+                              int nx_vis, int ny_vis,
+                              int sponge, int damp_gap, int damp_width,
+                              double dt, double *spacing,
+                              GridMetadata *grid,
+                              AppRenderState *render) {
+    memset(g, 0, sizeof(*g));
+    (void)spacing; /* reserved for future use (e.g. source gen uniforms) */
+
+    /* Shared vertex shader used by overlay and source-generator programs */
+    static const char *vs_src =
+        "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
+
+    /* --- Adopt the SDL/GL context into gpu_ctx ----------------------------- */
+    g->gpu_ctx = gpu_context_adopt(win, ctx, (int)nx, (int)ny);
+    if (!g->gpu_ctx) { fprintf(stderr, "gpu_context_adopt failed\n"); return -1; }
+
+    /* --- Compute tex-dict -------------------------------------------------- */
+    g->compute_tex_dict = gpu_tex_dict_create(8);
+
+    /* --- Paint composite (expression-compiled) ----------------------------- */
+    Expression *p_src_expr = expr_add(
+        expr_add(expr_variable("src"), expr_variable("paint_gpu")),
+        expr_variable("paint_cpu"));
+    g->paint_gpu_prog = gpu_compile_optimized(p_src_expr, grid, GPU_BACKEND_OPENGL);
+    expression_release(p_src_expr);
+    g->paint_tex_dict = gpu_tex_dict_create(8);
+    if (g->paint_gpu_prog &&
+        gpu_kernel_ensure_program(g->paint_gpu_prog->kernels[0]) == 0) {
+        /* GL program owned by kernel; paint_gpu_prog kept alive */
+    } else {
+        fprintf(stderr, "paint composite program compile failed\n");
+        if (g->paint_gpu_prog) { gpu_program_free(g->paint_gpu_prog); g->paint_gpu_prog = NULL; }
+    }
+
+    /* --- Damping texture + expression-compiled damping pass ---------------- */
+    g->damping_tex_dict = gpu_tex_dict_create(8);
+    float *damp_buf = calloc((size_t)nx * ny * 4, sizeof(float));
+    if (!damp_buf) { fprintf(stderr, "Failed to allocate damping buffer\n"); return -1; }
+
+    int v_x0 = sponge, v_x1 = sponge + nx_vis - 1;
+    int v_y0 = sponge, v_y1 = sponge + ny_vis - 1;
+    for (int j = 0; j < (int)ny; ++j) {
+        for (int i = 0; i < (int)nx; ++i) {
+            int cx = i, cy = j;
+            int dx = 0, dy = 0;
+            if (cx < v_x0) dx = v_x0 - cx; else if (cx > v_x1) dx = cx - v_x1;
+            if (cy < v_y0) dy = v_y0 - cy; else if (cy > v_y1) dy = cy - v_y1;
+            int dist = dx > dy ? dx : dy;
+            float sigma = 0.0f;
+            if (dist > damp_gap) {
+                float effective_dist  = (float)(dist - damp_gap);
+                float effective_width = (float)damp_width;
+                if (effective_width < 1.0f) effective_width = 1.0f;
+                float t = effective_dist / effective_width;
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+                const float DAMPING_SIGMA_MAX = 30.0f;
+                sigma = (float)(DAMPING_SIGMA_MAX * (t * t));
+            }
+            size_t idx = ((size_t)j * nx + i) * 4;
+            damp_buf[idx+0] = sigma;
+            damp_buf[idx+1] = damp_buf[idx+2] = 0.0f;
+            damp_buf[idx+3] = 1.0f;
+        }
+    }
+
+    GLuint tex_damping;
+    glGenTextures(1, &tex_damping);
+    glBindTexture(GL_TEXTURE_2D, tex_damping);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, (GLsizei)nx, (GLsizei)ny,
+                    0, GL_RGBA, GL_FLOAT, damp_buf);
+    free(damp_buf);
+    g->damping_tex = tex_damping;
+
+    /* Build damping expression:
+        u_new = (2 - sigma*dt)*u_curr - (1 - sigma*dt)*u_prev
+                + (u_next - 2*u_curr + u_prev)                    */
+    Expression *dn_next  = expr_variable("u_next");
+    Expression *dn_curr  = expr_variable("u_curr");
+    Expression *dn_prev  = expr_variable("u_prev");
+    Expression *dn_sigma = expr_variable("sigma");
+    Expression *dn_dt    = expr_literal(literal_create_scalar(dt));
+    Expression *dn_two   = expr_literal(literal_create_scalar(2.0));
+    Expression *dn_one   = expr_literal(literal_create_scalar(1.0));
+    Expression *sdt      = expr_multiply(dn_sigma, dn_dt);
+    Expression *two_curr = expr_multiply(dn_two, dn_curr);
+    Expression *accel    = expr_add(expr_add(dn_next, expr_negate(two_curr)), dn_prev);
+    Expression *coeff_curr = expr_add(dn_two, expr_negate(sdt));
+    Expression *coeff_prev = expr_add(sdt, expr_negate(dn_one));
+    Expression *damp_expr  = expr_add(
+        expr_add(expr_multiply(coeff_curr, dn_curr),
+                    expr_multiply(coeff_prev, dn_prev)),
+        accel);
+    GPUProgram *damp_gpu = gpu_compile_optimized(damp_expr, grid, GPU_BACKEND_OPENGL);
+    expression_release(damp_expr);
+    if (damp_gpu && gpu_kernel_ensure_program(damp_gpu->kernels[0]) == 0) {
+        g->damping_gpu_prog = damp_gpu;
+    } else {
+        fprintf(stderr, "Damping expression compile failed\n");
+        if (damp_gpu) gpu_program_free(damp_gpu);
+    }
+
+    /* --- Overlay shader (raw GLSL — visualisation only) -------------------- */
+    const char *overlay_fs =
+        "#version 120\n"
+        "uniform sampler2D mask_tex; uniform ivec2 dims; "
+        "uniform ivec2 vis_offset; uniform ivec2 vis_size;"
+        "void main() { vec2 uv = gl_TexCoord[0].st; "
+        "vec2 tex_idx = vec2(vis_offset) + uv * vec2(vis_size); "
+        "vec2 c = (floor(tex_idx) + vec2(0.5)) / vec2(dims); "
+        "float m = texture2D(mask_tex, c).r; "
+        "if (m > 0.5) gl_FragColor = vec4(1.0,1.0,0.0,1.0); "
+        "else gl_FragColor = vec4(0.0,0.0,0.0,0.0); }";
+    GLuint ov_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint ov_fs = compile_shader(GL_FRAGMENT_SHADER, overlay_fs);
+    if (ov_vs && ov_fs) g->overlay_prog = link_program(ov_vs, ov_fs);
+    if (ov_vs) glDeleteShader(ov_vs);
+    if (ov_fs) glDeleteShader(ov_fs);
+
+    if (g->overlay_prog) {
+        g->loc_ov_mask     = glGetUniformLocation(g->overlay_prog, "mask_tex");
+        g->loc_ov_dims     = glGetUniformLocation(g->overlay_prog, "dims");
+        g->loc_ov_vis_off  = glGetUniformLocation(g->overlay_prog, "vis_offset");
+        g->loc_ov_vis_size = glGetUniformLocation(g->overlay_prog, "vis_size");
+        glUseProgram(g->overlay_prog);
+        if (g->loc_ov_mask >= 0) glUniform1i(g->loc_ov_mask, 2);
+        glUseProgram(0);
+    }
+
+    /* --- Display render modes (expression-compiled) ------------------------ */
+    RenderModeDef modes[3];
+    memset(modes, 0, sizeof(modes));
+
+    /* Mode 0: Height — pos/neg channels with gamma compression */
+    Expression *src_var  = expr_variable("src");
+    Expression *zero_lit = expr_literal(literal_create_scalar(0.0));
+    Expression *gamma_lit = expr_literal(literal_create_scalar(0.5));
+    Expression *pos = expr_binary(OP_MAX, src_var, zero_lit);
+    Expression *neg = expr_binary(OP_MAX, expr_unary(OP_NEGATE, expr_variable("src")), zero_lit);
+    modes[0].chan_expr[0] = expr_power(pos, gamma_lit);
+    modes[0].chan_expr[2] = expr_power(neg, gamma_lit);
+    modes[0].chan_scale[0] = 0.5; modes[0].chan_scale[1] = 1.0; modes[0].chan_scale[2] = 0.5;
+
+    /* Mode 1: Velocity magnitude — sqrt(dx^2 + dy^2) */
+    Expression *dx = expr_derivative(expr_variable("src"), "x");
+    Expression *dy = expr_derivative(expr_variable("src"), "y");
+    Expression *sumsq = expr_binary(OP_ADD,
+        expr_binary(OP_MULTIPLY, dx, dx),
+        expr_binary(OP_MULTIPLY, dy, dy));
+    Expression *half = expr_literal(literal_create_scalar(0.5));
+    Expression *sumsq_sqrt = expr_power(sumsq, half);
+    modes[1].chan_expr[0] = sumsq_sqrt;
+    modes[1].chan_expr[1] = sumsq_sqrt;
+    modes[1].chan_expr[2] = sumsq_sqrt;
+    modes[1].chan_scale[0] = 0.5; modes[1].chan_scale[1] = 0.5; modes[1].chan_scale[2] = 0.5;
+
+    /* Mode 2: RGB — dx, dy, src */
+    modes[2].chan_expr[0] = expr_derivative(expr_variable("src"), "x");
+    modes[2].chan_expr[1] = expr_derivative(expr_variable("src"), "y");
+    modes[2].chan_expr[2] = expr_variable("src");
+    modes[2].chan_scale[0] = 0.5; modes[2].chan_scale[1] = 0.5; modes[2].chan_scale[2] = 0.5;
+
+    g->disp_prog_gpu = gpu_compile_render_modes(modes, 3, grid, GPU_BACKEND_OPENGL);
+
+    /* Release temporary mode expressions */
+    expression_release(modes[0].chan_expr[0]); 
+    expression_release(modes[0].chan_expr[2]);
+    expression_release(modes[1].chan_expr[0]); /* shared across channels — single release */
+    expression_release(modes[2].chan_expr[0]); 
+    expression_release(modes[2].chan_expr[1]);
+    expression_release(modes[2].chan_expr[2]);
+
+    if (g->disp_prog_gpu && g->disp_prog_gpu->n_kernels > 0 &&
+        g->disp_prog_gpu->kernels[0] &&
+        gpu_kernel_ensure_program(g->disp_prog_gpu->kernels[0]) == 0) {
+        g->disp_prog = (GLuint)g->disp_prog_gpu->kernels[0]->gl_program;
+    }
+    if (!g->disp_prog) {
+        fprintf(stderr, "Display program compile failed\n");
+        return -1;
+    }
+
+    /* --- GPURenderConfig for display pass ---------------------------------- */
+    g->disp_rc = gpu_render_config_create(g->disp_prog_gpu, g->disp_prog);
+    gpu_render_config_bind_uniform(g->disp_rc, "render_mode",     GPU_UNIFORM_INT,    &render->mode);
+    gpu_render_config_bind_uniform(g->disp_rc, "value_scale",     GPU_UNIFORM_DOUBLE, &render->value_scale);
+    gpu_render_config_bind_uniform(g->disp_rc, "show_boundaries", GPU_UNIFORM_BOOL,   &render->show_boundaries);
+    g->disp_rc->vis_offset_x = sponge;  g->disp_rc->vis_offset_y = sponge;
+    g->disp_rc->vis_size_x   = nx_vis;  g->disp_rc->vis_size_y   = ny_vis;
+
+    /* --- Source generator shader (raw GLSL — dynamic loop) ----------------- */
+    const char *srcgen_fs =
+        "#version 120\n"
+        "uniform sampler2D src_desc_tex;\n"
+        "uniform int n_sources;\n"
+        "uniform int max_src;\n"
+        "uniform float sim_time; uniform vec2 spacing; uniform ivec2 dims;\n"
+        "void main() { vec2 uv = gl_TexCoord[0].st; vec2 idx = floor(uv * vec2(dims)); float val = 0.0;\n"
+        " for (int i = 0; i < n_sources; ++i) { float fu = (0.5 + float(i)) / float(max_src);"
+        " vec4 a = texture2D(src_desc_tex, vec2(fu, 0.25)); vec4 b = texture2D(src_desc_tex, vec2(fu, 0.75));"
+        " float gx = a.r; float gy = a.g; float amp = a.b; float freq = a.a;"
+        " float phase = b.r; float radius = b.g;"
+        " float dx = (idx.x - gx) * spacing.x; float dy = (idx.y - gy) * spacing.y;"
+        " float r2 = dx*dx + dy*dy; float rr = radius * radius * spacing.x * spacing.x;"
+        " if (r2 <= rr) { val = amp * sin(freq * sim_time + phase); } }\n"
+        " gl_FragColor = vec4(val, 0.0, 0.0, 0.0); }";
+    GLuint s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint s_fs = compile_shader(GL_FRAGMENT_SHADER, srcgen_fs);
+    if (s_vs && s_fs) g->srcgen_prog = link_program(s_vs, s_fs);
+    if (s_vs) glDeleteShader(s_vs);
+    if (s_fs) glDeleteShader(s_fs);
+
+    if (g->srcgen_prog) {
+        glUseProgram(g->srcgen_prog);
+        g->loc_src_n       = glGetUniformLocation(g->srcgen_prog, "n_sources");
+        g->loc_src_time    = glGetUniformLocation(g->srcgen_prog, "sim_time");
+        g->loc_src_dims    = glGetUniformLocation(g->srcgen_prog, "dims");
+        g->loc_src_spacing = glGetUniformLocation(g->srcgen_prog, "spacing");
+        g->loc_src_desc    = glGetUniformLocation(g->srcgen_prog, "src_desc_tex");
+        g->loc_max_src     = glGetUniformLocation(g->srcgen_prog, "max_src");
+        if (g->loc_src_desc >= 0) glUniform1i(g->loc_src_desc, 4);
+        if (g->loc_max_src  >= 0) glUniform1i(g->loc_max_src, 64);
+        glUseProgram(0);
+    }
+
+    /* --- Source-descriptor texture (file-scope global tex_src_desc) --------- */
+    if (g->srcgen_prog) {
+        glGenTextures(1, &tex_src_desc);
+        glBindTexture(GL_TEXTURE_2D, tex_src_desc);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        int max_src_init = 64;
+        float *zero_buf = calloc((size_t)max_src_init * 2 * 4, sizeof(float));
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, max_src_init, 2, 0, GL_RGBA, GL_FLOAT, zero_buf);
+        free(zero_buf);
+    }
+
+    /* --- Wave compute expression + program --------------------------------- */
+    Expression *u_curr = expr_variable("u_curr");
+    Expression *u_prev = expr_variable("u_prev");
+    Expression *lap    = expr_laplacian(expr_variable("u_curr"));
+    double c = 1.0;
+    double c2dt2 = c * c * dt * dt;
+    Expression *c2dt2_lit = expr_literal(literal_create_scalar(c2dt2));
+    Expression *accel     = expr_multiply(c2dt2_lit, lap);
+    Expression *two       = expr_literal(literal_create_scalar(2.0));
+    Expression *two_u     = expr_multiply(two, u_curr);
+    Expression *neg_prev  = expr_negate(u_prev);
+    Expression *diff      = expr_add(two_u, neg_prev);
+    g->wave_expr    = expr_add(diff, accel);
+    g->compute_prog = gpu_compile_optimized(g->wave_expr, grid, GPU_BACKEND_OPENGL);
+    if (!g->compute_prog) {
+        fprintf(stderr, "wave compute gpu_compile_optimized failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Free all GPU objects owned by a WaveSimGPU.  Safe to call even if init
+ * failed partway through (checks each pointer before freeing).           */
+static void wave_sim_gpu_free(WaveSimGPU *g) {
+    if (!g) return;
+    if (g->disp_rc)          gpu_render_config_free(g->disp_rc);
+    if (g->compute_tex_dict) gpu_tex_dict_free(g->compute_tex_dict);
+    if (g->damping_tex_dict) gpu_tex_dict_free(g->damping_tex_dict);
+    if (g->paint_tex_dict)   gpu_tex_dict_free(g->paint_tex_dict);
+    if (g->damping_gpu_prog) gpu_program_free(g->damping_gpu_prog);
+    if (g->paint_gpu_prog)   gpu_program_free(g->paint_gpu_prog);
+    if (g->disp_prog_gpu)    gpu_program_free(g->disp_prog_gpu); /* owns disp_prog GL object */
+    if (g->overlay_prog)     glDeleteProgram(g->overlay_prog);
+    if (g->srcgen_prog)      glDeleteProgram(g->srcgen_prog);
+    if (g->damping_tex)      glDeleteTextures(1, &g->damping_tex);
+    if (g->compute_prog) gpu_program_free(g->compute_prog);
+    if (g->wave_expr)    expression_release(g->wave_expr);
+    if (g->gpu_ctx)          gpu_context_free(g->gpu_ctx);
+    memset(g, 0, sizeof(*g));
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     // Visible domain parameters (match interactive_wave_sim defaults roughly)
@@ -617,22 +944,7 @@ int main(int argc, char **argv) {
     grid_set_boundary(grid, 1, 0, BC_OPEN, 0.0);
     grid_set_boundary(grid, 1, 1, BC_OPEN, 0.0);
 
-    // Build wave update expression: u_next = 2*u_curr - u_prev + c^2 dt^2 Lap(u_curr)
-    Expression *u_curr = expr_variable("u_curr");
-    Expression *u_prev = expr_variable("u_prev");
-    Expression *lap = expr_laplacian(expr_variable("u_curr"));
-    double c = 1.0; double dt = 0.002; double c2dt2 = c*c*dt*dt;
-    Expression *c2dt2_lit = expr_literal(literal_create_scalar(c2dt2));
-    Expression *accel = expr_multiply(c2dt2_lit, lap);
-    Expression *two = expr_literal(literal_create_scalar(2.0));
-    Expression *two_u = expr_multiply(two, u_curr);
-    Expression *neg_prev = expr_negate(u_prev);
-    Expression *diff = expr_add(two_u, neg_prev);
-    Expression *wave_expr = expr_add(diff, accel);
-
-    // Compile expression into fragment GLSL using existing emitter
-    GPUProgram *prog = gpu_compile_optimized(wave_expr, grid, GPU_BACKEND_OPENGL);
-    if (!prog) { fprintf(stderr, "gpu compile failed\n"); return 1; }
+    double dt = 0.002; /* initial timestep; updated from app.dt each frame */
 
     // Initialize SDL2 + OpenGL context and window
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError()); return 1; }
@@ -645,28 +957,7 @@ int main(int argc, char **argv) {
     if (!ctx) { fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return 1; }
     glewExperimental = GL_TRUE; if (glewInit() != GLEW_OK) { fprintf(stderr, "glewInit failed\n"); }
 
-    // Compile compute shader (fragment shader returned by emitter)
-    const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-    // Use the emitted compute shader so masking and the wave update are applied
-    int use_test_compute = 0;
-    const char *test_fs = "";
-    GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-    GLuint fs = 0;
-    fs = compile_shader(GL_FRAGMENT_SHADER, prog->kernels[0]->source);
-    if (!vs || !fs) { fprintf(stderr, "shader compile failed\n"); return 1; }
-    GLuint compute_prog = link_program(vs, fs);
-    glDeleteShader(vs); glDeleteShader(fs);
-    if (!compute_prog) { fprintf(stderr, "link failed\n"); return 1; }
-
-    // Paint composite shader: add GPU-generated paint and CPU paint into src_tex and write to out
-    const char *paint_fs = "#version 120\nuniform sampler2D src_tex; uniform sampler2D paint_gpu; uniform sampler2D paint_cpu; void main() { vec2 uv = gl_TexCoord[0].st; float s = texture2D(src_tex, uv).r; float pg = texture2D(paint_gpu, uv).r; float pc = texture2D(paint_cpu, uv).r; gl_FragColor = vec4(s + pg + pc, 0.0, 0.0, 0.0); }";
-    GLuint p_fs = compile_shader(GL_FRAGMENT_SHADER, paint_fs);
-    GLuint p_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-    GLuint p_prog = link_program(p_vs, p_fs);
-    glDeleteShader(p_vs); glDeleteShader(p_fs);
-    if (!p_prog) { fprintf(stderr, "paint program link failed\n"); }
-
-    // Prepare initial CPU fields (u_curr with a gaussian source; u_prev zeros)
+    // Prepare initial CPU fields (u_curr zeroed; u_prev zeros)
     double *u_curr_data = calloc((size_t)nx * ny, sizeof(double));
     double *u_prev_data = calloc((size_t)nx * ny, sizeof(double));
 
@@ -674,7 +965,6 @@ int main(int argc, char **argv) {
     BoundaryMask *bm = boundary_mask_create(grid);
     // barrier segments array (dynamic, starts empty)
     BarrierSeg *barrier_segs = NULL; int n_barrier_segs = 0;
-    // initially no barrier segments; user adds via mouse in barrier mode
     // Drag state for barrier point editing
     int barrier_drag_active = 0; /* 0/1 */
     int barrier_drag_seg = -1;  /* segment index being edited */
@@ -691,7 +981,7 @@ int main(int argc, char **argv) {
     int barrier_drag_press_mx = 0, barrier_drag_press_my = 0;
     /* Pending start point when building a new barrier (visible before second click) */
     int barrier_pending = 0;
-    int barrier_pending_x = -1, barrier_pending_y = -1; // -1 means pending start not yet set; capture on release
+    int barrier_pending_x = -1, barrier_pending_y = -1;
 
     // Create GPU textures from fields (total grid size includes sponge)
     GLuint tex_u_curr = create_texture_from_field(u_curr_data, nx, ny);
@@ -699,181 +989,67 @@ int main(int argc, char **argv) {
     GLuint tex_out = create_empty_texture(nx, ny);
     // temporary texture used by damping pass
     GLuint tex_tmp = create_empty_texture(nx, ny);
-    // damping program/texture (created below) - declare here so they are usable in the main loop
-    GLuint damping_prog = 0;
-    GLuint damping_tex = 0;
-    GLint loc_damp_src = -1, loc_damp_tex = -1, loc_damp_prev = -1, loc_damp_sigma = -1, loc_damp_dt = -1, loc_damp_dims = -1;
     // Paint textures and CPU paint buffer (RGBA32F)
     paint_buf = calloc((size_t)nx * ny * 4, sizeof(float));
     tex_paint = create_empty_texture(nx, ny);     /* GPU-generated paint */
     tex_paint_cpu = create_empty_texture(nx, ny); /* CPU-uploaded paint buffer */
     paint_pending = 0;
-    paint_from_gpu = 0; /* true when tex_paint was filled by GPU shader this frame */
-    paint_buf_dirty = 0; /* true when paint_buf contains CPU paint that must be uploaded */
+    paint_from_gpu = 0;
+    paint_buf_dirty = 0;
     int painting_active = 0;
     uint64_t sim_step_counter = 0; /* counts physics steps (used for source phase) */
     uint64_t render_frame_counter = 0; /* counts rendered frames */
-
-    // Prepare FBO used for compute (render to textures)
-    GLuint fbo; glGenFramebuffers(1, &fbo);
 
     int win_w = 800, win_h = 800;
 
     // Upload the interior barrier mask textures (needs GL context)
     boundary_mask_upload(bm, NULL);
 
-    // Prepare damping texture: per-texel sigma (SIGMA_MAX * (1 - d/w)^2) in red channel
-    float *damp_buf = calloc((size_t)nx * ny * 4, sizeof(float));
-    if (damp_buf) {
-        // visible region indices
-        int v_x0 = sponge; int v_x1 = sponge + nx_vis - 1;
-        int v_y0 = sponge; int v_y1 = sponge + ny_vis - 1;
-        for (int j = 0; j < (int)ny; ++j) for (int i = 0; i < (int)nx; ++i) {
-            int cx = i; int cy = j;
-            int dx = 0, dy = 0;
-            if (cx < v_x0) dx = v_x0 - cx; else if (cx > v_x1) dx = cx - v_x1;
-            if (cy < v_y0) dy = v_y0 - cy; else if (cy > v_y1) dy = cy - v_y1;
-            int dist = dx > dy ? dx : dy;
-            float sigma = 0.0f;
-            /* start damping only after damp_gap texels; ramp over damp_width */
-            if (dist > damp_gap) {
-                float effective_dist = (float)(dist - damp_gap);
-                float effective_width = (float)(damp_width);
-                if (effective_width < 1.0f) effective_width = 1.0f;
-                float t = effective_dist / effective_width;
-                if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
-                     const float DAMPING_SIGMA_MAX = 30.0f; /* increased from 10.0 */
-                     /* Quadratic growth: sigma starts at 0 at the start of the ramp and
-                         increases toward DAMPING_SIGMA_MAX at the outer edge (no hard
-                         boundary). This makes damping stronger as distance to the
-                         visible region increases. */
-                     sigma = (float)(DAMPING_SIGMA_MAX * (t * t));
-            }
-            size_t idx = ((size_t)j * nx + i) * 4;
-            damp_buf[idx+0] = sigma; damp_buf[idx+1] = 0.0f; damp_buf[idx+2] = 0.0f; damp_buf[idx+3] = 1.0f;
-        }
-        GLuint tex_damping; glGenTextures(1, &tex_damping);
-        glBindTexture(GL_TEXTURE_2D, tex_damping);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, nx, ny, 0, GL_RGBA, GL_FLOAT, damp_buf);
-        free(damp_buf);
+    // Initialise app/render state before GPU init (disp_rc binds pointers into render)
+    AppState app = {0};
+    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; app.dt = 0.002;
+    app.steps_per_frame = 1.0; app.wave_amplitude = 0.002; app.wave_spread = 0.05;
+    app.default_source_frequency = 5.0; app.default_source_phase = 0.0;
+    app.mouse_none = 1; app.show_base_menu = 1; app.limit_fps = 1;
+    AppRenderState render = {0};
+    render.mode = RENDER_HEIGHT; render.value_scale = 1.0; render.show_boundaries = 1;
+    render.show_stats = 1; render.mode_height = 1;
 
-        // Damping shader: apply CPU-equivalent sponge
-        const char *damp_fs = "#version 120\n"
-            "uniform sampler2D next_tex; uniform sampler2D curr_tex; uniform sampler2D prev_tex; uniform sampler2D sigma_tex; uniform float dt; uniform ivec2 dims; void main() { vec2 uv = gl_TexCoord[0].st; vec2 c = (floor(uv * vec2(dims)) + vec2(0.5)) / vec2(dims); float un = texture2D(next_tex, c).r; float uc = texture2D(curr_tex, c).r; float up = texture2D(prev_tex, c).r; float sigma = texture2D(sigma_tex, c).r; float accel = un - 2.0 * uc + up; float sdt = sigma * dt; float unew = (2.0 - sdt) * uc - (1.0 - sdt) * up + accel; gl_FragColor = vec4(unew, 0.0, 0.0, 0.0); }";
-        GLuint d_fs = compile_shader(GL_FRAGMENT_SHADER, damp_fs);
-        GLuint d_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-        if (d_fs && d_vs) damping_prog = link_program(d_vs, d_fs);
-        if (d_vs) glDeleteShader(d_vs); if (d_fs) glDeleteShader(d_fs);
-        // store damping texture into outer-scope variable so main loop can use it
-        damping_tex = tex_damping;
-        // query shader sampler locations (bind units)
-        if (damping_prog) {
-            glUseProgram(damping_prog);
-            loc_damp_src = glGetUniformLocation(damping_prog, "next_tex"); if (loc_damp_src >= 0) glUniform1i(loc_damp_src, 0);
-            loc_damp_tex = glGetUniformLocation(damping_prog, "curr_tex"); if (loc_damp_tex >= 0) glUniform1i(loc_damp_tex, 1);
-            loc_damp_prev = glGetUniformLocation(damping_prog, "prev_tex"); if (loc_damp_prev >= 0) glUniform1i(loc_damp_prev, 2);
-            loc_damp_sigma = glGetUniformLocation(damping_prog, "sigma_tex"); if (loc_damp_sigma >= 0) glUniform1i(loc_damp_sigma, 3);
-            loc_damp_dt = glGetUniformLocation(damping_prog, "dt");
-            loc_damp_dims = glGetUniformLocation(damping_prog, "dims"); if (loc_damp_dims >= 0) glUniform2i(loc_damp_dims, (GLint)nx, (GLint)ny);
-            glUseProgram(0);
-        }
-    } else {
-        fprintf(stderr, "Failed to allocate damping buffer\n");
-    }
-    // FBO already created above
-
-    // Overlay shader to draw white lines where the mask is active (final pass)
-    /* Overlay: draw mask as translucent yellow to make it more obvious on top
-       of the rendered field. Use simple sampling (texel-centered) and emit
-       alpha < 1 so underlying field remains visible. */
-    const char *overlay_fs =
-        "#version 120\n"
-        "uniform sampler2D mask_tex; uniform ivec2 dims; uniform ivec2 vis_offset; uniform ivec2 vis_size;"
-        "void main() { vec2 uv = gl_TexCoord[0].st; vec2 tex_idx = vec2(vis_offset) + uv * vec2(vis_size); vec2 c = (floor(tex_idx) + vec2(0.5)) / vec2(dims); float m = texture2D(mask_tex, c).r; if (m > 0.5) gl_FragColor = vec4(1.0,1.0,0.0,1.0); else gl_FragColor = vec4(0.0,0.0,0.0,0.0); }";
-    GLuint ov_fs = compile_shader(GL_FRAGMENT_SHADER, overlay_fs);
-    GLuint ov_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-    GLuint overlay_prog = 0;
-    if (ov_vs && ov_fs) overlay_prog = link_program(ov_vs, ov_fs);
-    if (ov_vs) glDeleteShader(ov_vs);
-    if (ov_fs) glDeleteShader(ov_fs);
-
-
-    // Prepare display shader by defining render modes as expressions and compiling
-    // them into a single monolithic shader via the GPU compiler helper.
-    RenderModeDef modes[3]; memset(modes, 0, sizeof(modes));
-    // Mode 0: Height coloring - use a nonlinear mapping so small height differences are exaggerated
-    // R = pow(max(src,0), gamma); B = pow(max(-src,0), gamma)
-    Expression *src_var = expr_variable("src");
-    Expression *zero_lit = expr_literal(literal_create_scalar(0.0));
-    /* gamma < 1 increases small values (e.g. gamma = 0.5 is sqrt) */
-    Expression *gamma_lit = expr_literal(literal_create_scalar(0.5));
-    Expression *pos = expr_binary(OP_MAX, src_var, zero_lit); // max(src, 0)
-    Expression *neg = expr_binary(OP_MAX, expr_unary(OP_NEGATE, expr_variable("src")), zero_lit); // max(-src, 0)
-    Expression *pos_pow = expr_power(pos, gamma_lit);
-    Expression *neg_pow = expr_power(neg, gamma_lit);
-    modes[0].chan_expr[0] = pos_pow;
-    modes[0].chan_expr[1] = NULL;
-    modes[0].chan_expr[2] = neg_pow;
-    modes[0].chan_scale[0] = 0.5; modes[0].chan_scale[1] = 1.0; modes[0].chan_scale[2] = 0.5;
-    modes[0].chan_apply_sqrt[0] = 0; modes[0].chan_apply_sqrt[1] = 0; modes[0].chan_apply_sqrt[2] = 0;
-
-    
-    // Mode 1: velocity magnitude - compute sqrt(dx*dx + dy*dy) and show as grayscale
-    Expression *dx = expr_derivative(expr_variable("src"), "x");
-    Expression *dy = expr_derivative(expr_variable("src"), "y");
-    // build squared sum expression = dx*dx + dy*dy
-    Expression *dx2 = expr_binary(OP_MULTIPLY, dx, dx);
-    Expression *dy2 = expr_binary(OP_MULTIPLY, dy, dy);
-    Expression *sumsq = expr_binary(OP_ADD, dx2, dy2);
-    // take power 0.5 (sqrt) explicitly via expression so GLSL emits pow(...,0.5)
-    Expression *half = expr_literal(literal_create_scalar(0.5));
-    Expression *sumsq_sqrt = expr_power(sumsq, half);
-    modes[1].chan_expr[0] = sumsq_sqrt;
-    modes[1].chan_expr[1] = sumsq_sqrt;
-    modes[1].chan_expr[2] = sumsq_sqrt;
-    // apply modest per-channel scale to avoid saturation
-    modes[1].chan_scale[0] = 0.5; modes[1].chan_scale[1] = 0.5; modes[1].chan_scale[2] = 0.5;
-    modes[1].chan_apply_sqrt[0] = 0; modes[1].chan_apply_sqrt[1] = 0; modes[1].chan_apply_sqrt[2] = 0;
-
-
-    // Mode 2: RGB mapping: R=dx, G=dy, B=src -- apply small per-channel scales so each fits in range
-    modes[2].chan_expr[0] = expr_derivative(expr_variable("src"), "x");
-    modes[2].chan_expr[1] = expr_derivative(expr_variable("src"), "y");
-    modes[2].chan_expr[2] = expr_variable("src");
-    modes[2].chan_scale[0] = 0.5; modes[2].chan_scale[1] = 0.5; modes[2].chan_scale[2] = 0.5;
-    modes[2].chan_apply_sqrt[0] = 0; modes[2].chan_apply_sqrt[1] = 0; modes[2].chan_apply_sqrt[2] = 0;
-
-    // Compile into GPUProgram
-    GPUProgram *disp_prog_gpu = gpu_compile_render_modes(modes, 3, grid, GPU_BACKEND_OPENGL);
-    // release temporary expressions (may be shared across channels)
-    expression_release(modes[0].chan_expr[0]); expression_release(modes[0].chan_expr[2]);
-    expression_release(modes[1].chan_expr[0]); /* sumsq shared across channels - single release */
-    expression_release(modes[2].chan_expr[0]); expression_release(modes[2].chan_expr[1]); expression_release(modes[2].chan_expr[2]);
-
-    // Fallback: if compilation to GPUProgram failed, fall back to the previous hardcoded shader
-    GLuint disp_prog = 0;
-    const char *disp_vs = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-    if (disp_prog_gpu && disp_prog_gpu->kernels && disp_prog_gpu->kernels[0] && disp_prog_gpu->kernels[0]->source) {
-        GLuint d_vs = compile_shader(GL_VERTEX_SHADER, disp_vs);
-        GLuint d_fs = compile_shader(GL_FRAGMENT_SHADER, disp_prog_gpu->kernels[0]->source);
-        if (d_vs && d_fs) disp_prog = link_program(d_vs, d_fs);
-        if (d_vs) glDeleteShader(d_vs); if (d_fs) glDeleteShader(d_fs);
-    }
-    if (!disp_prog) {
-        printf("Display program compile failed; \n");
+    /* Initialise all GPU programs, tex-dicts and render config. */
+    WaveSimGPU g;
+    if (wave_sim_gpu_init(&g, win, ctx, nx, ny, nx_vis, ny_vis,
+                          sponge, damp_gap, damp_width, dt,
+                          spacing, grid, &render) != 0) {
+        fprintf(stderr, "wave_sim_gpu_init failed\n");
         return 1;
     }
 
-    // Create app/menu state + menus
-    AppState app = {0};
-    app.paused = 0; app.wave_speed = 1.0; app.max_sim_speed = 1.0; app.dt = 0.002; app.steps_per_frame = 1.0; app.wave_amplitude = 0.002; /* lower default addition amplitude (scaled) */ app.wave_spread = 0.05; app.default_source_frequency = 5.0; app.default_source_phase = 0.0; app.mouse_none = 1; app.show_base_menu = 1; app.show_mouse_controls = 0; app.show_sim_controls = 0; app.max_sim_speed = 1.0; app.limit_fps = 1;
-    AppRenderState render = {0};
-    render.mode = RENDER_HEIGHT; render.value_scale = 1.0; render.show_boundaries = 1; render.show_stats = 1; render.mode_height = 1; render.mode_velocity = 0; render.mode_rgb = 0;
+    /* Convenience aliases so the rest of main can keep its existing names. */
+    GPUProgram     **prog_ref         = &g.compute_prog; /* indirection so cb updates are visible */
+    GPUContext      *gpu_ctx          = g.gpu_ctx;
+    GPUTexDict      *compute_tex_dict = g.compute_tex_dict;
+    GPUProgram      *paint_gpu_prog   = g.paint_gpu_prog;
+    GPUTexDict      *paint_tex_dict   = g.paint_tex_dict;
+    GPUProgram      *damping_gpu_prog = g.damping_gpu_prog;
+    GPUTexDict      *damping_tex_dict = g.damping_tex_dict;
+    GLuint           damping_tex      = g.damping_tex;
+    GLuint           overlay_prog     = g.overlay_prog;
+    GLint            loc_ov_mask      = g.loc_ov_mask;
+    GLint            loc_ov_dims      = g.loc_ov_dims;
+    GLint            loc_ov_vis_off   = g.loc_ov_vis_off;
+    GLint            loc_ov_vis_size  = g.loc_ov_vis_size;
+    GPURenderConfig *disp_rc          = g.disp_rc;
+    GLuint           srcgen_prog      = g.srcgen_prog;
+    GLint            loc_src_n        = g.loc_src_n;
+    GLint            loc_src_time     = g.loc_src_time;
+    GLint            loc_src_dims     = g.loc_src_dims;
+    GLint            loc_src_spacing  = g.loc_src_spacing;
+    GLint            loc_src_desc     = g.loc_src_desc;
+    GLint            loc_max_src      = g.loc_max_src;
+
+    /* Retrieve the shared FBO from gpu_ctx. */
+    GLuint fbo = gpu_context_get_fbo(gpu_ctx);
+    if (!fbo) { fprintf(stderr, "gpu_context_get_fbo returned 0\n"); return 1; }
 
     // Prepare reset callback data (heap alloc so pointer stays valid). It holds
     // pointers to the texture variables used for ping-pong so the callback
@@ -885,9 +1061,9 @@ int main(int argc, char **argv) {
     reset_data->data_curr = u_curr_data;
     reset_data->data_prev = u_prev_data;
     reset_data->nx = nx; reset_data->ny = ny; reset_data->last_ms = 0;
-    reset_data->gpu_prog_ptr = &prog;
-    reset_data->compute_prog_ptr = &compute_prog;
-    reset_data->wave_expr_ptr = &wave_expr;
+    reset_data->gpu_prog_ptr = &g.compute_prog;
+    reset_data->compute_prog_ptr = NULL;  /* compute shader managed by gpu_ctx kernel cache */
+    reset_data->wave_expr_ptr = &g.wave_expr;
     reset_data->grid_ptr = grid;
     reset_data->dt_val = dt;
     reset_data->app_wave_speed_ptr = &app.wave_speed;
@@ -903,94 +1079,17 @@ int main(int argc, char **argv) {
     }
     AppMenus *menus = create_app_menus(&app, &render, reset_data);
 
-    // Query uniform locations for compute program and bind static sampler indices
-    GLint loc_dims = glGetUniformLocation(compute_prog, "dims");
-    GLint loc_spacing = glGetUniformLocation(compute_prog, "spacing");
-    GLint loc_use_mask = glGetUniformLocation(compute_prog, "use_mask");
-    // Set sampler indices for variables (u_curr_tex -> unit 0, u_prev_tex -> unit 1)
-    GLint loc_u_curr = glGetUniformLocation(compute_prog, "u_curr_tex"); if (loc_u_curr>=0) glUseProgram(compute_prog), glUniform1i(loc_u_curr, 0);
-    GLint loc_u_prev = glGetUniformLocation(compute_prog, "u_prev_tex"); if (loc_u_prev>=0) glUseProgram(compute_prog), glUniform1i(loc_u_prev, 1);
-    // Mask/value samplers will be bound to units 2 and 3
-    glUseProgram(compute_prog);
-    GLint loc_mask = glGetUniformLocation(compute_prog, "mask_tex"); if (loc_mask>=0) glUniform1i(loc_mask, 2);
-    GLint loc_val = glGetUniformLocation(compute_prog, "val_tex"); if (loc_val>=0) glUniform1i(loc_val, 3);
-    // Restore program 0
-    glUseProgram(0);
-
-    // Prepare paint program uniform locations (if created)
-    GLint loc_p_src = -1, loc_p_paint_gpu = -1, loc_p_paint_cpu = -1;
-    if (p_prog) {
-        glUseProgram(p_prog);
-        loc_p_src = glGetUniformLocation(p_prog, "src_tex"); if (loc_p_src >= 0) glUniform1i(loc_p_src, 0);
-        loc_p_paint_gpu = glGetUniformLocation(p_prog, "paint_gpu"); if (loc_p_paint_gpu >= 0) glUniform1i(loc_p_paint_gpu, 1);
-        loc_p_paint_cpu = glGetUniformLocation(p_prog, "paint_cpu"); if (loc_p_paint_cpu >= 0) glUniform1i(loc_p_paint_cpu, 2);
-        glUseProgram(0);
-    }
-
-    /* GPU-side source generator program: renders a per-texel paint texture
-       from the active sources (last-source-wins semantics to match CPU). */
-    GLuint srcgen_prog = 0;
-    GLint loc_src_n = -1, loc_src_time = -1, loc_src_dims = -1, loc_src_spacing = -1;
-    /* cached uniform locations for descriptor sampler and max width */
-    GLint loc_src_desc = -1, loc_max_src = -1;
-    GLint loc_src_gx = -1, loc_src_gy = -1, loc_src_amp = -1, loc_src_freq = -1, loc_src_phase = -1, loc_src_radius = -1;
-    {
-        /* Shader reads source descriptors from a 2-row texture: row 0 = (gx, gy, amp, freq), row 1 = (phase, radius, unused, unused) */
-        const char *srcgen_fs =
-            "#version 120\n"
-            "uniform sampler2D src_desc_tex;\n"
-            "uniform int n_sources;\n"
-            "uniform int max_src;\n"
-            "uniform float sim_time; uniform vec2 spacing; uniform ivec2 dims;\n"
-            "void main() { vec2 uv = gl_TexCoord[0].st; vec2 idx = floor(uv * vec2(dims)); float val = 0.0;\n"
-            " for (int i = 0; i < n_sources; ++i) { float fu = (0.5 + float(i)) / float(max_src); vec4 a = texture2D(src_desc_tex, vec2(fu, 0.25)); vec4 b = texture2D(src_desc_tex, vec2(fu, 0.75)); float gx = a.r; float gy = a.g; float amp = a.b; float freq = a.a; float phase = b.r; float radius = b.g; float dx = (idx.x - gx) * spacing.x; float dy = (idx.y - gy) * spacing.y; float r2 = dx*dx + dy*dy; float rr = radius * radius * spacing.x * spacing.x; if (r2 <= rr) { val = amp * sin(freq * sim_time + phase); } }\n"
-            " gl_FragColor = vec4(val, 0.0, 0.0, 0.0); }";
-        GLuint s_vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-        GLuint s_fs = compile_shader(GL_FRAGMENT_SHADER, srcgen_fs);
-        if (s_vs && s_fs) srcgen_prog = link_program(s_vs, s_fs);
-        if (s_vs) glDeleteShader(s_vs); if (s_fs) glDeleteShader(s_fs);
-            if (srcgen_prog) {
-            glUseProgram(srcgen_prog);
-            loc_src_n = glGetUniformLocation(srcgen_prog, "n_sources");
-            loc_src_time = glGetUniformLocation(srcgen_prog, "sim_time"); loc_src_dims = glGetUniformLocation(srcgen_prog, "dims"); loc_src_spacing = glGetUniformLocation(srcgen_prog, "spacing");
-            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
-            loc_src_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_src_desc >= 0) glUniform1i(loc_src_desc, 4);
-            loc_max_src = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_max_src >= 0) glUniform1i(loc_max_src, 64);
-            /* cache descriptor sampler and max_src uniform locations to avoid per-frame queries */
-            GLint loc_desc = glGetUniformLocation(srcgen_prog, "src_desc_tex"); if (loc_desc >= 0) { glUniform1i(loc_desc, 4); }
-            GLint loc_mx = glGetUniformLocation(srcgen_prog, "max_src"); if (loc_mx >= 0) { glUniform1i(loc_mx, 64); }
-            /* create source-descriptor texture (max 64 sources, 2 rows) */
-            glGenTextures(1, &tex_src_desc);
-            glBindTexture(GL_TEXTURE_2D, tex_src_desc);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-            /* allocate 64x2 RGBA32F texture, initialize to zero */
-            int max_src = 64;
-            float *zero_buf = calloc((size_t)max_src * 2 * 4, sizeof(float));
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, max_src, 2, 0, GL_RGBA, GL_FLOAT, zero_buf);
-            free(zero_buf);
-            glUseProgram(0);
-        }
-    }
-
     // Set GL state (window size)
     glViewport(0,0,win_w,win_h);
     int quit = 0; SDL_Event ev;
     uint32_t last_time = SDL_GetTicks();
-    int debug_readback_done = 0;
 
-    // One-time initial display of the uploaded field so user sees the source/barrier
-    glUseProgram(disp_prog);
-    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-    glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-    GLint loc_src_init = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src_init>=0) glUniform1i(loc_src_init, 0);
-    GLint loc_mask_disp = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_mask_disp>=0) glUniform1i(loc_mask_disp, 2);
-    GLint loc_show_bound_init = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound_init>=0) glUniform1i(loc_show_bound_init, render.show_boundaries ? 1 : 0);
+    // One-time initial display — use disp_rc (caches locations on first call)
+    gpu_render_config_set_tex(disp_rc, "src",  tex_u_curr);
+    gpu_render_config_set_tex(disp_rc, "mask", bm && bm->mask_tex ? bm->mask_tex : 0);
     glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
-    draw_fullscreen_quad();
+    gpu_render_config_draw(disp_rc);
+    glUseProgram(0);
 
 
     // save states
@@ -1000,24 +1099,18 @@ int main(int argc, char **argv) {
     // draw overlay opaque (disable blending so mask is clearly visible)
     if (blendEnabled) glDisable(GL_BLEND);
 
-    // draw overlay lines for mask every frame (use alpha-blend so we can update fragcolor without discard)
+    // draw overlay lines for mask (one-time initial frame; uses cached locations)
     if (overlay_prog && bm && bm->mask_tex) {
         glUseProgram(overlay_prog);
         glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-        GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
-        GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
+        if (loc_ov_mask >= 0) glUniform1i(loc_ov_mask, 2);
+        if (loc_ov_dims >= 0) glUniform2i(loc_ov_dims, (GLint)nx, (GLint)ny);
         draw_fullscreen_quad();
     }
-    // Restore states
     glUseProgram(0);
     if (blendEnabled) glEnable(GL_BLEND);
     if (depthEnabled) glEnable(GL_DEPTH_TEST);
     SDL_GL_SwapWindow(win);
-
-     /* Debug helper: print one sample from the mask texture at center after
-         the first frame so we can confirm the mask content the overlay will
-         sample from. This is a one-shot readback to stderr. */
-     int overlay_debug_print = 1;
 
     // Simulation loop: run until window closed
     while (!quit) {
@@ -1032,13 +1125,11 @@ int main(int argc, char **argv) {
                 // Reset shortcut: trigger the same reset callback used by the menu
                 cb_reset(NULL, reset_data);
                 // Immediately display the uploaded initial field so the user sees the reset even when paused
-                glUseProgram(disp_prog);
-                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-                GLint loc_src_tmp = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src_tmp>=0) glUniform1i(loc_src_tmp, 0);
-                GLint loc_mask_tmp = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_mask_tmp>=0) glUniform1i(loc_mask_tmp, 2);
+                gpu_render_config_set_tex(disp_rc, "src",  tex_u_curr);
+                gpu_render_config_set_tex(disp_rc, "mask", bm && bm->mask_tex ? bm->mask_tex : 0);
                 glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
-                draw_fullscreen_quad();
+                gpu_render_config_draw(disp_rc);
+                glUseProgram(0);
                 SDL_GL_SwapWindow(win);
             }
             // Forward mouse events to menus (best-effort)
@@ -1374,28 +1465,16 @@ int main(int argc, char **argv) {
                         paint_buf_dirty = 0;
                         paint_cpu_uploaded = 1; /* remember we uploaded non-zero CPU paint */
                     }
-                    // composite: render src=tex_u_curr + paint -> tex_out
-                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_out, 0);
-                    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                    if (st == GL_FRAMEBUFFER_COMPLETE) {
-                        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-                        glUseProgram(p_prog);
-                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                        /* bind GPU paint to unit 1 */
-                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_paint);
-                        /* bind CPU paint to unit 2 */
-                        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_paint_cpu);
-                        if (loc_p_src >= 0) glUniform1i(loc_p_src, 0);
-                        if (loc_p_paint_gpu >= 0) glUniform1i(loc_p_paint_gpu, 1);
-                        if (loc_p_paint_cpu >= 0) glUniform1i(loc_p_paint_cpu, 2);
-                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-                        draw_fullscreen_quad(); glFlush();
-                        GLuint tmp = tex_u_curr; tex_u_curr = tex_out; tex_out = tmp;
-                    } else {
-                        fprintf(stderr, "FBO incomplete for paint composite: 0x%x\n", st);
-                        fflush(stderr);
+                    // composite: src + paint_gpu + paint_cpu → tex_out via expression program
+                    if (paint_gpu_prog) {
+                        gpu_tex_dict_set(paint_tex_dict, "src",       tex_u_curr);
+                        gpu_tex_dict_set(paint_tex_dict, "paint_gpu", tex_paint);
+                        gpu_tex_dict_set(paint_tex_dict, "paint_cpu", tex_paint_cpu);
+                        if (gpu_run_program_to_tex(paint_gpu_prog, paint_tex_dict, tex_out, gpu_ctx) == 0) {
+                            GLuint tmp = tex_u_curr; tex_u_curr = tex_out; tex_out = tmp;
+                        } else {
+                            fprintf(stderr, "paint composite gpu_run_program_to_tex failed\n"); fflush(stderr);
+                        }
                     }
                           /* clear CPU paint buffer and upload zeros to cpu paint texture so
                               CPU additions are applied only once (until user paints again) */
@@ -1426,30 +1505,16 @@ int main(int argc, char **argv) {
                 /* ensure we render at texture resolution so fragments map 1:1 to texels */
                 glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
 
-                glUseProgram(compute_prog);
-                // Bind inputs: u_curr -> unit 0, u_prev -> unit 1
-                glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
-                // Bind mask/value textures if present -> units 2,3
-                if (bm && bm->mask_tex) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex); }
-                if (bm && bm->values_tex) { glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, bm->values_tex); }
-
-                // Set uniforms while program is bound (ensure sampler units are wired)
-                if (loc_u_curr >= 0) glUniform1i(loc_u_curr, 0);
-                if (loc_u_prev >= 0) glUniform1i(loc_u_prev, 1);
-                if (loc_mask >= 0) glUniform1i(loc_mask, 2);
-                if (loc_val >= 0) glUniform1i(loc_val, 3);
-                if (loc_dims >= 0) glUniform2i(loc_dims, (GLint)nx, (GLint)ny);
-                if (loc_spacing >= 0) glUniform2f(loc_spacing, (float)spacing[0], (float)spacing[1]);
-                if (loc_use_mask >= 0) glUniform1i(loc_use_mask, bm ? 1 : 0);
-
-                // Draw quad to compute u_next
-                glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
+                /* Wave compute pass: use gpu_run_program_to_tex which internally
+                   compiles the shader once, binds named input textures from the dict,
+                   and renders into tex_out with no CPU readback.                     */
+                gpu_tex_dict_set(compute_tex_dict, "u_curr", tex_u_curr);
+                gpu_tex_dict_set(compute_tex_dict, "u_prev", tex_u_prev);
+                gpu_program_set_boundary_mask(*prog_ref, bm);
                 /* GPU timing: sample occasionally to avoid blocking every frame. */
                 uint32_t _gpu_t_before = 0;
                 if (gpu_time_sample_period > 0) _gpu_t_before = SDL_GetTicks();
-                draw_fullscreen_quad();
+                gpu_run_program_to_tex(*prog_ref, compute_tex_dict, tex_out, gpu_ctx);
                 glFlush();
                 gpu_time_step_counter++;
                 if (gpu_time_sample_period > 0 && gpu_time_step_counter >= gpu_time_sample_period) {
@@ -1470,33 +1535,19 @@ int main(int argc, char **argv) {
                 tex_u_curr = tex_out;
                 tex_out = tex_prev;
 
-                /* Apply damping (sponge) pass: multiply tex_u_curr by damping texture into tex_tmp, then copy back into tex_u_curr */
-                if (damping_prog && damping_tex) {
-                    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex_tmp, 0);
-                    GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-                    if (st == GL_FRAMEBUFFER_COMPLETE) {
-                        glViewport(0, 0, (GLsizei)nx, (GLsizei)ny);
-                        glUseProgram(damping_prog);
-                        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-                        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, tex_u_prev);
-                        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, tex_prev);
-                        glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, damping_tex);
-                        GLint loc_next = glGetUniformLocation(damping_prog, "next_tex"); if (loc_next >= 0) glUniform1i(loc_next, 0);
-                        GLint loc_curr = glGetUniformLocation(damping_prog, "curr_tex"); if (loc_curr >= 0) glUniform1i(loc_curr, 1);
-                        GLint loc_prev = glGetUniformLocation(damping_prog, "prev_tex"); if (loc_prev >= 0) glUniform1i(loc_prev, 2);
-                        GLint loc_sigma = glGetUniformLocation(damping_prog, "sigma_tex"); if (loc_sigma >= 0) glUniform1i(loc_sigma, 3);
-                        GLint loc_dt = glGetUniformLocation(damping_prog, "dt"); if (loc_dt >= 0) glUniform1f(loc_dt, (float)dt);
-                        GLint loc_dims_d = glGetUniformLocation(damping_prog, "dims"); if (loc_dims_d >= 0) glUniform2i(loc_dims_d, (GLint)nx, (GLint)ny);
-                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
-                        glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-                        draw_fullscreen_quad(); glFlush();
+                /* Apply damping (sponge) pass via expression-compiled program. */
+                if (damping_gpu_prog && damping_tex) {
+                    /* u_next=tex_u_curr (post-wave), u_curr=tex_u_prev, u_prev=tex_prev (pre-ping-pong tex_out),
+                       sigma=damping_tex */
+                    gpu_tex_dict_set(damping_tex_dict, "u_next",  tex_u_curr);
+                    gpu_tex_dict_set(damping_tex_dict, "u_curr",  tex_u_prev);
+                    gpu_tex_dict_set(damping_tex_dict, "u_prev",  tex_prev);
+                    gpu_tex_dict_set(damping_tex_dict, "sigma",   damping_tex);
+                    if (gpu_run_program_to_tex(damping_gpu_prog, damping_tex_dict, tex_tmp, gpu_ctx) == 0) {
                         GLuint ttmp = tex_u_curr; tex_u_curr = tex_tmp; tex_tmp = ttmp;
                     } else {
-                        fprintf(stderr, "FBO incomplete for damping pass: 0x%x\n", st);
+                        fprintf(stderr, "damping gpu_run_program_to_tex failed\n");
                     }
-                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                    glViewport(0,0,win_w,win_h);
                 }
                 // increment sim counter for each physics step performed
                 sim_step_counter++;
@@ -1507,23 +1558,12 @@ int main(int argc, char **argv) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0,0,win_w,win_h);
 
-        // Render current field to screen using unified display shader
-        glUseProgram(disp_prog);
-        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex_u_curr);
-        glActiveTexture(GL_TEXTURE2); if (bm && bm->mask_tex) glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-        GLint loc_src = glGetUniformLocation(disp_prog, "src_tex"); if (loc_src>=0) glUniform1i(loc_src, 0);
-        GLint loc_maskd = glGetUniformLocation(disp_prog, "mask_tex"); if (loc_maskd>=0) glUniform1i(loc_maskd, 2);
-        GLint loc_mode = glGetUniformLocation(disp_prog, "render_mode"); if (loc_mode>=0) glUniform1i(loc_mode, render.mode);
-        GLint loc_vscl = glGetUniformLocation(disp_prog, "value_scale"); if (loc_vscl>=0) glUniform1f(loc_vscl, (float)render.value_scale);
-        GLint loc_dims_disp = glGetUniformLocation(disp_prog, "dims"); if (loc_dims_disp>=0) glUniform2i(loc_dims_disp, (GLint)nx, (GLint)ny);
-        GLint loc_vis_off_disp = glGetUniformLocation(disp_prog, "vis_offset"); if (loc_vis_off_disp>=0) glUniform2i(loc_vis_off_disp, (GLint)sponge, (GLint)sponge);
-        GLint loc_vis_size_disp = glGetUniformLocation(disp_prog, "vis_size"); if (loc_vis_size_disp>=0) glUniform2i(loc_vis_size_disp, (GLint)nx_vis, (GLint)ny_vis);
-        GLint loc_spacing_disp = glGetUniformLocation(disp_prog, "spacing"); if (loc_spacing_disp>=0) glUniform2f(loc_spacing_disp, (float)spacing[0], (float)spacing[1]);
-        GLint loc_show_bound = glGetUniformLocation(disp_prog, "show_boundaries"); if (loc_show_bound>=0) glUniform1i(loc_show_bound, render.show_boundaries ? 1 : 0);
+        // Render current field to screen — one call via GPURenderConfig
+        gpu_render_config_set_tex(disp_rc, "src",  tex_u_curr);
+        gpu_render_config_set_tex(disp_rc, "mask", bm && bm->mask_tex ? bm->mask_tex : 0);
         glClearColor(0.1f,0.1f,0.12f,1.0f); glClear(GL_COLOR_BUFFER_BIT);
-        draw_fullscreen_quad();
-        // Unbind any GL program so menu uses fixed-function pipeline rendering
-        glUseProgram(0);
+        gpu_render_config_draw(disp_rc);
+        glUseProgram(0);  /* back to fixed-function for menus */
         // Draw overlay lines for mask on top of the display but beneath menus
         if (overlay_prog && bm && bm->mask_tex) {
             GLboolean depthEnabled_ov = glIsEnabled(GL_DEPTH_TEST);
@@ -1532,10 +1572,11 @@ int main(int argc, char **argv) {
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glUseProgram(overlay_prog);
             glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, bm->mask_tex);
-            GLint loc_mask_ov = glGetUniformLocation(overlay_prog, "mask_tex"); if (loc_mask_ov>=0) glUniform1i(loc_mask_ov, 2);
-            GLint loc_dims_ov = glGetUniformLocation(overlay_prog, "dims"); if (loc_dims_ov>=0) glUniform2i(loc_dims_ov, (GLint)nx, (GLint)ny);
-            GLint loc_vis_off_ov = glGetUniformLocation(overlay_prog, "vis_offset"); if (loc_vis_off_ov>=0) glUniform2i(loc_vis_off_ov, (GLint)sponge, (GLint)sponge);
-            GLint loc_vis_size_ov = glGetUniformLocation(overlay_prog, "vis_size"); if (loc_vis_size_ov>=0) glUniform2i(loc_vis_size_ov, (GLint)nx_vis, (GLint)ny_vis);
+            /* Use cached locations — no glGetUniformLocation per frame */
+            if (loc_ov_mask     >= 0) glUniform1i(loc_ov_mask, 2);
+            if (loc_ov_dims     >= 0) glUniform2i(loc_ov_dims, (GLint)nx, (GLint)ny);
+            if (loc_ov_vis_off  >= 0) glUniform2i(loc_ov_vis_off,  (GLint)sponge, (GLint)sponge);
+            if (loc_ov_vis_size >= 0) glUniform2i(loc_ov_vis_size, (GLint)nx_vis,  (GLint)ny_vis);
             draw_fullscreen_quad();
             // restore states
             glUseProgram(0);
@@ -1727,16 +1768,14 @@ int main(int argc, char **argv) {
     }
 
     // Cleanup
-    glDeleteProgram(compute_prog);
-    if (p_prog) glDeleteProgram(p_prog);
-    if (disp_prog) glDeleteProgram(disp_prog);
+    wave_sim_gpu_free(&g);
     glDeleteTextures(1, &tex_u_curr); glDeleteTextures(1, &tex_u_prev); glDeleteTextures(1, &tex_out);
+    glDeleteTextures(1, &tex_tmp);
+    if (tex_src_desc) glDeleteTextures(1, &tex_src_desc);
     if (tex_paint) glDeleteTextures(1, &tex_paint);
     if (bm) boundary_mask_free(bm);
     free(u_curr_data); free(u_prev_data);
     if (paint_buf) free(paint_buf);
-    gpu_program_free(prog);
-    expression_release(wave_expr);
     grid_metadata_free(grid);
     SDL_GL_DeleteContext(ctx); SDL_DestroyWindow(win); SDL_Quit();
     return 0;

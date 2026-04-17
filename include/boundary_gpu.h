@@ -19,6 +19,8 @@ typedef struct BoundaryMask {
     GridMetadata *grid;
     unsigned int mask_tex;      // GL texture id (if uploaded)
     unsigned int values_tex;    // values texture id
+    int dirty;                  // non-zero when CPU data has changed since last upload
+    int uploaded;               // non-zero once textures have been created
 } BoundaryMask;
 
 BoundaryMask* boundary_mask_create(GridMetadata *grid);

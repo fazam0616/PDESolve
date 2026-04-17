@@ -10,6 +10,7 @@
 #include "../include/grid.h"
 #include "../include/dictionary.h"
 #include "../include/boundary_gpu.h"
+#include "../include/calculus.h"
 
 // GPU-only runtime: emit minimal GLSL for pointwise expressions and execute
 // using an offscreen SDL/OpenGL context. This removes the CPU-backed fallback
@@ -93,10 +94,175 @@ static void draw_fullscreen_quad(void) {
     glEnd();
 }
 
-/* Centralized expression emitter.
-   `coord` should be "uv" or "c" depending on which sampling coordinate
-   the caller wants the emitted GLSL to use. Returns a malloc'd string that
-   the caller must free. */
+/* -----------------------------------------------------------------------
+ * Derivative-lowering pre-pass: distributes OP_DERIVATIVE and OP_LAPLACIAN
+ * inward through compound expressions so that emit_expr_common only ever
+ * sees OP_DERIVATIVE(variable, axis) or OP_DERIVATIVE(OP_DERIVATIVE(var,y),x)
+ * at the leaves — both of which it handles as finite-difference stencils.
+ * ----------------------------------------------------------------------- */
+
+/* Forward declaration for mutual recursion */
+static Expression* gpu_expand_derivative(Expression *e, const char *axis);
+
+/* Walk the expression tree and lower all compound derivative nodes.
+   Does not consume `e`; returns a freshly allocated tree (free with
+   expression_free when done). */
+static Expression* gpu_lower_derivatives(Expression *e) {
+    if (!e) return NULL;
+    switch (e->type) {
+        case EXPR_LITERAL:  return expr_copy(e);
+        case EXPR_VARIABLE: return expr_copy(e);
+
+        case EXPR_UNARY:
+            if (e->data.unary.op == OP_DERIVATIVE) {
+                Expression *op = e->data.unary.operand;
+                const char *ax = e->data.unary.with_respect_to
+                                  ? e->data.unary.with_respect_to : "x";
+                /* Already canonical: OP_DERIVATIVE(variable, axis) */
+                if (op && op->type == EXPR_VARIABLE)
+                    return expr_copy(e);
+                /* Already canonical: OP_DERIVATIVE(OP_DERIVATIVE(var,y), x) */
+                if (op && op->type == EXPR_UNARY
+                    && op->data.unary.op == OP_DERIVATIVE
+                    && op->data.unary.operand
+                    && op->data.unary.operand->type == EXPR_VARIABLE)
+                    return expr_copy(e);
+                /* Compound operand: lower it then distribute derivative inward */
+                Expression *lowered_op = gpu_lower_derivatives(op);
+                Expression *result = gpu_expand_derivative(lowered_op, ax);
+                expression_free(lowered_op);
+                return result;
+            } else if (e->data.unary.op == OP_LAPLACIAN) {
+                Expression *op = e->data.unary.operand;
+                /* Already canonical: OP_LAPLACIAN(variable) */
+                if (op && op->type == EXPR_VARIABLE)
+                    return expr_copy(e);
+                /* Compound: ∇²f = ∂/∂x(∂f/∂x) + ∂/∂y(∂f/∂y) */
+                Expression *lowered_op = gpu_lower_derivatives(op);
+                Expression *df_dx   = gpu_expand_derivative(lowered_op, "x");
+                Expression *d2f_dx2 = gpu_expand_derivative(df_dx, "x");
+                expression_free(df_dx);
+                Expression *df_dy   = gpu_expand_derivative(lowered_op, "y");
+                Expression *d2f_dy2 = gpu_expand_derivative(df_dy, "y");
+                expression_free(df_dy);
+                expression_free(lowered_op);
+                return expr_add(d2f_dx2, d2f_dy2);
+            } else if (e->data.unary.op == OP_NEGATE) {
+                return expr_negate(gpu_lower_derivatives(e->data.unary.operand));
+            } else if (e->data.unary.op == OP_TRANSPOSE) {
+                return expr_transpose(gpu_lower_derivatives(e->data.unary.operand));
+            } else {
+                /* Generic fallback: recurse into operand, rebuild node */
+                Expression *lop = gpu_lower_derivatives(e->data.unary.operand);
+                Expression *r = expr_unary(e->data.unary.op, lop);
+                if (e->data.unary.with_respect_to)
+                    r->data.unary.with_respect_to =
+                        strdup(e->data.unary.with_respect_to);
+                return r;
+            }
+
+        case EXPR_BINARY: {
+            Expression *nl = gpu_lower_derivatives(e->data.binary.left);
+            Expression *nr = gpu_lower_derivatives(e->data.binary.right);
+            switch (e->data.binary.op) {
+                case OP_ADD:      return expr_add(nl, nr);
+                case OP_MULTIPLY: return expr_multiply(nl, nr);
+                case OP_POW:      return expr_power(nl, nr);
+                case OP_MIN:      return expr_min(nl, nr);
+                case OP_MAX:      return expr_max(nl, nr);
+                case OP_MATMUL:   return expr_matmul(nl, nr);
+                case OP_DOT:      return expr_dot(nl, nr);
+                case OP_EINSUM: {
+                    IndexSpec *s = e->data.binary.index_spec;
+                    if (s) return expr_einsum(nl, s->left_indices,
+                                              nr, s->right_indices, s->out_indices);
+                    return expr_binary(OP_EINSUM, nl, nr);
+                }
+                default: return expr_binary(e->data.binary.op, nl, nr);
+            }
+        }
+    }
+    return expr_literal(literal_create_scalar(0.0));
+}
+
+/* Distribute ∂/∂axis inward through `e` using sum rule and product rule,
+   leaving OP_DERIVATIVE(variable, axis) nodes at the leaves.
+   Does not consume `e`; returns a freshly allocated tree. */
+static Expression* gpu_expand_derivative(Expression *e, const char *axis) {
+    if (!e) return expr_literal(literal_create_scalar(0.0));
+    switch (e->type) {
+        case EXPR_LITERAL:
+            return expr_literal(literal_create_scalar(0.0));
+
+        case EXPR_VARIABLE:
+            return expr_derivative(expr_copy(e), axis);
+
+        case EXPR_UNARY:
+            switch (e->data.unary.op) {
+                case OP_NEGATE:
+                    return expr_negate(
+                        gpu_expand_derivative(e->data.unary.operand, axis));
+                case OP_DERIVATIVE:
+                    /* ∂/∂axis(∂var/∂inner) — keeps as nested node;
+                       emit_expr_common handles the two-level chain as a
+                       2nd-order or mixed-partial stencil. */
+                    return expr_derivative(expr_copy(e), axis);
+                default:
+                    /* OP_LAPLACIAN, OP_TRANSPOSE, etc — can't expand;
+                       leave as nested derivative; emitter will report error. */
+                    return expr_derivative(expr_copy(e), axis);
+            }
+
+        case EXPR_BINARY:
+            switch (e->data.binary.op) {
+                case OP_ADD: {
+                    /* ∂(u+v)/∂axis = ∂u/∂axis + ∂v/∂axis */
+                    Expression *dl = gpu_expand_derivative(e->data.binary.left,  axis);
+                    Expression *dr = gpu_expand_derivative(e->data.binary.right, axis);
+                    return expr_add(dl, dr);
+                }
+                case OP_MULTIPLY: {
+                    /* ∂(u*v)/∂axis = u*(∂v/∂axis) + (∂u/∂axis)*v */
+                    Expression *u  = expr_copy(e->data.binary.left);
+                    Expression *v  = expr_copy(e->data.binary.right);
+                    Expression *du = gpu_expand_derivative(e->data.binary.left,  axis);
+                    Expression *dv = gpu_expand_derivative(e->data.binary.right, axis);
+                    return expr_add(expr_multiply(u, dv), expr_multiply(du, v));
+                }
+                default:
+                    /* OP_POW, OP_MIN, OP_MAX, OP_MATMUL, OP_DOT, OP_EINSUM —
+                       can't expand cleanly; leave as nested derivative so
+                       emit_expr_common produces a specific error. */
+                    return expr_derivative(expr_copy(e), axis);
+            }
+    }
+    return expr_literal(literal_create_scalar(0.0));
+}
+
+/* Return a malloc'd error sentinel: NULL signals a fatal codegen error to the
+   caller; before returning NULL we print a diagnostic to stderr.           */
+#define GPU_EMIT_UNSUPPORTED(fmt, ...) \
+    do { fprintf(stderr, "[gpu_compiler] unsupported: " fmt "\n", ##__VA_ARGS__); } while(0)
+
+/* Map an Operation enum value to a human-readable name for diagnostics. */
+static const char *op_name(Operation op) {
+    switch (op) {
+        case OP_ADD:       return "OP_ADD";
+        case OP_NEGATE:    return "OP_NEGATE";
+        case OP_MULTIPLY:  return "OP_MULTIPLY";
+        case OP_MATMUL:    return "OP_MATMUL";
+        case OP_DOT:       return "OP_DOT";
+        case OP_TRANSPOSE: return "OP_TRANSPOSE";
+        case OP_DERIVATIVE:return "OP_DERIVATIVE";
+        case OP_LAPLACIAN: return "OP_LAPLACIAN";
+        case OP_EINSUM:    return "OP_EINSUM";
+        case OP_POW:       return "OP_POW";
+        case OP_MIN:       return "OP_MIN";
+        case OP_MAX:       return "OP_MAX";
+        default:           return "<unknown op>";
+    }
+}
+
 static char* emit_expr_common(Expression *e, const char *coord) {
     if (!e) return strdup("0.0");
     if (e->type == EXPR_LITERAL) {
@@ -123,6 +289,56 @@ static char* emit_expr_common(Expression *e, const char *coord) {
                 }
                 return out;
             }
+            /* Second-order stencil: OP_DERIVATIVE(OP_DERIVATIVE(var, inner), outer)
+               produced by gpu_lower_derivatives when expanding compound Laplacians
+               or nested derivatives. */
+            if (op && op->type == EXPR_UNARY && op->data.unary.op == OP_DERIVATIVE
+                && op->data.unary.operand
+                && op->data.unary.operand->type == EXPR_VARIABLE) {
+                const char *name  = op->data.unary.operand->data.variable;
+                const char *inner = op->data.unary.with_respect_to
+                                     ? op->data.unary.with_respect_to : "x";
+                char *out = malloc(2048);
+                if (strcmp(inner, axis) == 0) {
+                    /* ∂²u/∂axis² — 3-point second-derivative stencil */
+                    if (strcmp(axis, "x") == 0 || strcmp(axis, "i") == 0) {
+                        snprintf(out, 2048,
+                            "((texture2D(%s_tex, %s + vec2(1.0/float(dims.x),0)).r"
+                            " - 2.0*texture2D(%s_tex, %s).r"
+                            " + texture2D(%s_tex, %s - vec2(1.0/float(dims.x),0)).r)"
+                            " / (spacing.x*spacing.x))",
+                            name, coord, name, coord, name, coord);
+                    } else {
+                        snprintf(out, 2048,
+                            "((texture2D(%s_tex, %s + vec2(0,1.0/float(dims.y))).r"
+                            " - 2.0*texture2D(%s_tex, %s).r"
+                            " + texture2D(%s_tex, %s - vec2(0,1.0/float(dims.y))).r)"
+                            " / (spacing.y*spacing.y))",
+                            name, coord, name, coord, name, coord);
+                    }
+                } else {
+                    /* ∂²u/∂x∂y — 4-point mixed-partial stencil */
+                    snprintf(out, 2048,
+                        "((texture2D(%s_tex, %s + vec2( 1.0/float(dims.x), 1.0/float(dims.y))).r"
+                        " - texture2D(%s_tex, %s + vec2(-1.0/float(dims.x), 1.0/float(dims.y))).r"
+                        " - texture2D(%s_tex, %s + vec2( 1.0/float(dims.x),-1.0/float(dims.y))).r"
+                        " + texture2D(%s_tex, %s + vec2(-1.0/float(dims.x),-1.0/float(dims.y))).r)"
+                        " / (4.0*spacing.x*spacing.y))",
+                        name, coord, name, coord, name, coord, name, coord);
+                }
+                return out;
+            }
+            /* OP_DERIVATIVE of a still-compound expression after lowering:
+               gpu_lower_derivatives could not expand it (e.g. OP_POW operand). */
+            /* OP_DERIVATIVE of a compound expression: compound finite-difference
+               lowering is not yet implemented.  Emit an error with the operand type. */
+            const char *operand_desc = (op && op->type == EXPR_BINARY)  ? "binary expression" :
+                                       (op && op->type == EXPR_UNARY)   ? "unary expression"  :
+                                       (op && op->type == EXPR_LITERAL)  ? "literal"           : "unknown";
+            GPU_EMIT_UNSUPPORTED("OP_DERIVATIVE/%s of a compound %s (only direct variable operands are supported; "
+                                 "pre-expand compound derivatives before calling gpu_compile_*)",
+                                 axis, operand_desc);
+            return NULL;
         } else if (e->data.unary.op == OP_LAPLACIAN) {
             Expression *op = e->data.unary.operand;
             if (op && op->type == EXPR_VARIABLE) {
@@ -135,31 +351,72 @@ static char* emit_expr_common(Expression *e, const char *coord) {
                     name, coord, name, coord, name, coord);
                 return out;
             }
+            /* OP_LAPLACIAN of a compound expression: would require expanding
+               ∇²f(g(x)) → chain-rule stencil, not yet implemented. */
+            const char *operand_desc = (op && op->type == EXPR_BINARY)  ? "binary expression" :
+                                       (op && op->type == EXPR_UNARY)   ? "unary expression"  :
+                                       (op && op->type == EXPR_LITERAL)  ? "literal"           : "unknown";
+            GPU_EMIT_UNSUPPORTED("OP_LAPLACIAN of a compound %s (only direct variable operands are supported; "
+                                 "pre-expand compound Laplacians before calling gpu_compile_*)",
+                                 operand_desc);
+            return NULL;
         } else if (e->data.unary.op == OP_NEGATE) {
             char *sub = emit_expr_common(e->data.unary.operand, coord);
+            if (!sub) return NULL; /* propagate error */
             size_t need = strlen(sub) + 8; /* allow for (-() ) and NUL */
             char *out = malloc(need);
             if (out) snprintf(out, need, "(-(%s))", sub);
             free(sub);
             return out;
+        } else if (e->data.unary.op == OP_TRANSPOSE) {
+            GPU_EMIT_UNSUPPORTED("OP_TRANSPOSE — matrix transpose has no pointwise GLSL representation; "
+                                 "only scalar field expressions are supported by the GPU compiler");
+            return NULL;
+        } else {
+            GPU_EMIT_UNSUPPORTED("unary op %s — not implemented in GPU compiler", op_name(e->data.unary.op));
+            return NULL;
         }
     } else if (e->type == EXPR_BINARY) {
+        if (e->data.binary.op == OP_MATMUL) {
+            GPU_EMIT_UNSUPPORTED("OP_MATMUL — matrix multiplication has no pointwise GLSL representation; "
+                                 "only scalar field expressions are supported by the GPU compiler");
+            return NULL;
+        } else if (e->data.binary.op == OP_DOT) {
+            GPU_EMIT_UNSUPPORTED("OP_DOT — vector dot product has no pointwise GLSL representation; "
+                                 "only scalar field expressions are supported by the GPU compiler");
+            return NULL;
+        } else if (e->data.binary.op == OP_EINSUM) {
+            const char *li = e->data.binary.index_spec ? e->data.binary.index_spec->left_indices  : "?";
+            const char *ri = e->data.binary.index_spec ? e->data.binary.index_spec->right_indices : "?";
+            const char *oi = e->data.binary.index_spec ? e->data.binary.index_spec->out_indices   : "?";
+            GPU_EMIT_UNSUPPORTED("OP_EINSUM (%s,%s->%s) — Einstein summation requires reduction across "
+                                 "multiple texels and is not supported by the GPU compiler",
+                                 li, ri, oi);
+            return NULL;
+        }
         char *L = emit_expr_common(e->data.binary.left, coord);
+        if (!L) return NULL; /* propagate error */
         char *R = emit_expr_common(e->data.binary.right, coord);
+        if (!R) { free(L); return NULL; } /* propagate error */
         size_t need = strlen(L) + strlen(R) + 64;
         char *out = malloc(need);
         if (out) {
-            if (e->data.binary.op == OP_ADD) snprintf(out, need, "((%s) + (%s))", L, R);
+            if (e->data.binary.op == OP_ADD)      snprintf(out, need, "((%s) + (%s))", L, R);
             else if (e->data.binary.op == OP_MULTIPLY) snprintf(out, need, "((%s) * (%s))", L, R);
             else if (e->data.binary.op == OP_POW) snprintf(out, need, "pow((%s), (%s))", L, R);
             else if (e->data.binary.op == OP_MIN) snprintf(out, need, "min((%s), (%s))", L, R);
             else if (e->data.binary.op == OP_MAX) snprintf(out, need, "max((%s), (%s))", L, R);
-            else snprintf(out, need, "(0.0)");
+            else {
+                GPU_EMIT_UNSUPPORTED("binary op %s — not implemented in GPU compiler", op_name(e->data.binary.op));
+                free(L); free(R); free(out);
+                return NULL;
+            }
         }
         free(L); free(R);
         return out;
     }
-    return strdup("0.0");
+    GPU_EMIT_UNSUPPORTED("expression type %d — unknown expression type, cannot emit GLSL", (int)e->type);
+    return NULL;
 }
 
 /* Collect variable names referenced by an expression into `vars`/`nvars`.
@@ -188,52 +445,58 @@ static void collect_expr_vars(Expression *e, char ***vars, int *nvars) {
 // - scalar literals (double -> float constant)
 // This is intentionally small to match current tests.
 static char* emit_glsl_for_expr(Expression *expr, GridMetadata *grid, char ***out_var_list, int *out_nvars) {
-    // Collect variable names referenced by `expr`
+    /* Lower compound derivatives before collecting variables or emitting GLSL.
+       The returned tree is owned by this function and freed before returning. */
+    Expression *lowered = gpu_lower_derivatives(expr);
     char **vars = NULL; int nvars = 0;
-    collect_expr_vars(expr, &vars, &nvars);
+    collect_expr_vars(lowered, &vars, &nvars);
 
-    // Build GLSL
-    const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-    // fragment: sample variables and compute result
-    size_t buf = 8192;
-    char *fs = calloc(1, buf);
-    strncat(fs, "#version 120\n", buf- strlen(fs)-1);
-    strncat(fs, "uniform sampler2D tex0;\n", buf- strlen(fs)-1);
+    // Build GLSL with a dynamically grown buffer
+    size_t cap = 8192;
+    char *fs = calloc(1, cap);
+
+/* Append a string to fs, growing the buffer if needed */
+#define FS_APPEND(str) do { \
+    const char *_s = (str); \
+    size_t _need = strlen(fs) + strlen(_s) + 1; \
+    if (_need > cap) { cap = _need * 2; fs = realloc(fs, cap); } \
+    strcat(fs, _s); \
+} while(0)
+
+    FS_APPEND("#version 120\n");
+    FS_APPEND("uniform sampler2D tex0;\n");
     // map each var to texN
-    for (int i=0;i<nvars;i++) {
+    for (int i = 0; i < nvars; i++) {
         char line[128];
         snprintf(line, sizeof(line), "uniform sampler2D %s_tex;\n", vars[i]);
-        strncat(fs, line, buf- strlen(fs)-1);
+        FS_APPEND(line);
     }
-    // use standard texcoord ordering (s,t)
-    // provide grid metadata to shader for stencil offsets
-    strncat(fs, "uniform ivec2 dims;\n", buf- strlen(fs)-1);
-    strncat(fs, "uniform vec2 spacing;\n", buf- strlen(fs)-1);
-    // snap uv to texel centers: floor(uv * dims) + 0.5 -> center coord
-    // allow optional boundary mask/value samplers (declare at global scope)
-    strncat(fs, "uniform sampler2D mask_tex;\n", buf- strlen(fs)-1);
-    strncat(fs, "uniform sampler2D val_tex;\n", buf- strlen(fs)-1);
-     /* only sample mask/val when enabled by runtime to avoid accidental
-         sampling of unbound samplers which may default to texture unit 0 */
-     strncat(fs, "uniform int use_mask;\n", buf- strlen(fs)-1);
-    strncat(fs, "void main() { vec2 uv = gl_TexCoord[0].st; uv = (floor(uv * vec2(dims)) + vec2(0.5)) / vec2(dims); float result = 0.0;\n", buf- strlen(fs)-1);
+    FS_APPEND("uniform ivec2 dims;\n");
+    FS_APPEND("uniform vec2 spacing;\n");
+    FS_APPEND("uniform sampler2D mask_tex;\n");
+    FS_APPEND("uniform sampler2D val_tex;\n");
+    FS_APPEND("uniform int use_mask;\n");
+    FS_APPEND("void main() { vec2 uv = gl_TexCoord[0].st; uv = (floor(uv * vec2(dims)) + vec2(0.5)) / vec2(dims); float result = 0.0;\n");
 
-    char *body = emit_expr_common(expr, "uv");
-    strncat(fs, " result = ", buf- strlen(fs)-1);
-    strncat(fs, body, buf- strlen(fs)-1);
+    char *body = emit_expr_common(lowered, "uv");
+    if (!body) {
+        /* emit_expr_common already printed the specific error */
+        expression_free(lowered);
+        free(fs);
+        if (vars) { for (int i=0;i<nvars;i++) free(vars[i]); free(vars); }
+        return NULL;
+    }
+    FS_APPEND(" result = ");
+    FS_APPEND(body);
     free(body);
-    // if mask indicates a boundary point, override with val_tex; only sample
-    // mask/val when runtime sets use_mask to non-zero to avoid sampling
-    // uninitialized samplers.
-    strncat(fs, "; if (use_mask != 0) { float m = texture2D(mask_tex, uv).r; if (m > 0.5) result = texture2D(val_tex, uv).r; } gl_FragColor = vec4(result, 0.0, 0.0, 0.0); }\n", buf- strlen(fs)-1);
+    FS_APPEND("; if (use_mask != 0) { float m = texture2D(mask_tex, uv).r; if (m > 0.5) result = texture2D(val_tex, uv).r; } gl_FragColor = vec4(result, 0.0, 0.0, 0.0); }\n");
 
+#undef FS_APPEND
+
+    expression_free(lowered);
     *out_var_list = vars;
     *out_nvars = nvars;
-    // Note: caller will compile shaders with vs_src and fs
-    char *full = malloc(strlen(vs_src)+strlen(fs)+1);
-    strcpy(full, fs); // return fragment source only (vertex source kept local)
-    free(fs);
-    return full;
+    return fs;
 }
 
 /* Emit GLSL fragment source for an array of render-mode definitions. The
@@ -243,21 +506,11 @@ static char* emit_glsl_for_expr(Expression *expr, GridMetadata *grid, char ***ou
    sampler2D uniforms named <var>_tex. */
 static char* emit_glsl_for_render_modes(RenderModeDef *modes, int n_modes, GridMetadata *grid, char ***out_var_list, int *out_nvars) {
     if (!modes || n_modes <= 0) return NULL;
-    // collect variables across all expressions
+    // collect variables across all expressions using the shared file-static helper
     char **vars = NULL; int nvars = 0;
-    void collect(Expression *e) {
-        if (!e) return;
-        if (e->type == EXPR_VARIABLE) {
-            const char *name = e->data.variable;
-            int found = 0; for (int i=0;i<nvars;i++) if (strcmp(vars[i], name) == 0) { found = 1; break; }
-            if (!found) { vars = realloc(vars, sizeof(char*)*(nvars+1)); vars[nvars++] = strdup(name); }
-        } else if (e->type == EXPR_UNARY) {
-            collect(e->data.unary.operand);
-        } else if (e->type == EXPR_BINARY) {
-            collect(e->data.binary.left); collect(e->data.binary.right);
-        }
-    }
-    for (int m=0;m<n_modes;m++) for (int c=0;c<3;c++) collect(modes[m].chan_expr[c]);
+    for (int m = 0; m < n_modes; m++)
+        for (int c = 0; c < 3; c++)
+            collect_expr_vars(modes[m].chan_expr[c], &vars, &nvars);
 
     size_t buf = 16384;
     char *fs = calloc(1, buf);
@@ -299,7 +552,15 @@ static char* emit_glsl_for_render_modes(RenderModeDef *modes, int n_modes, GridM
             if (!e) {
                 char line[64]; snprintf(line, sizeof(line), "  float ch%d = 0.0;\n", c); strncat(fs, line, buf - strlen(fs) -1);
             } else {
-                char *es = emit_expr_common(e, "c");
+                Expression *lowered_e = gpu_lower_derivatives(e);
+                char *es = emit_expr_common(lowered_e, "c");
+                expression_free(lowered_e);
+                if (!es) {
+                    /* emit_expr_common already printed the specific error */
+                    free(fs);
+                    if (vars) { for (int i=0;i<nvars;i++) free(vars[i]); free(vars); }
+                    return NULL;
+                }
                 char line[1024];
                 double scale = 1.0;
                 int apply_sqrt = 0;
@@ -437,6 +698,16 @@ void gpu_program_free(GPUProgram *prog) {
             free(k->owned_exprs);
             k->owned_exprs = NULL; k->n_owned_exprs = 0;
         }
+        /* Release cached GL resources if a context is still current */
+        if (k->gl_program) { glDeleteProgram(k->gl_program); k->gl_program = 0; }
+        if (k->gl_output_tex) { glDeleteTextures(1, &k->gl_output_tex); k->gl_output_tex = 0; }
+        if (k->gl_input_tex) {
+            for (int j = 0; j < k->n_gl_inputs; ++j)
+                if (k->gl_input_tex[j]) glDeleteTextures(1, &k->gl_input_tex[j]);
+            free(k->gl_input_tex);
+            k->gl_input_tex = NULL;
+        }
+        if (k->uloc_inputs) { free(k->uloc_inputs); k->uloc_inputs = NULL; }
         if (k->source) free(k->source);
         if (k->inputs) {
             for (int j = 0; j < k->n_inputs; ++j) if (k->inputs[j]) free(k->inputs[j]);
@@ -452,47 +723,24 @@ void gpu_program_free(GPUProgram *prog) {
     free(prog);
 }
 
-struct GPUContext { int backend; };
+struct GPUContext {
+    int backend;
+    /* Persistent SDL/GL resources */
+    SDL_Window *win;
+    SDL_GLContext gl_ctx;
+    GLuint fbo;          /* shared framebuffer object, 0 = not yet created */
+    int initialized;     /* 1 after successful gl_make_context_hidden + glewInit */
+    int adopted;         /* 1 when SDL resources are owned by the caller, not us */
+    int width, height;   /* dimensions the context was created for */
+};
 
 GPUContext* gpu_context_create(GPUBackend backend) {
     GPUContext *ctx = calloc(1, sizeof(GPUContext));
+    if (!ctx) return NULL;
     ctx->backend = (int)backend;
+    /* Defer actual GL initialisation until the first use so the grid size is
+       known. The context is fully initialised in gpu_run_program(). */
     return ctx;
-}
-
-// Upload a GridField into an RGBA float texture; returns texture id (caller owns)
-static GLuint upload_field_as_texture(const GridField *field) {
-    uint32_t w = field->grid->dims[0];
-    uint32_t h = field->grid->dims[1];
-    float *buf = calloc(w * h * 4, sizeof(float));
-    // OpenGL expects image data rows starting from the bottom. The grid
-    // metadata uses j=0 as the top row. Literal storage stores elements with
-    // offset = i * h + j (i is the slowest index), so read using that
-    // convention and write into the GL buffer as row-major (j * w + i).
-    const Literal *lit = &field->data;
-    for (uint32_t j_gl = 0; j_gl < h; ++j_gl) {
-        uint32_t src_j = h - 1 - j_gl; // grid row corresponding to this GL row
-        for (uint32_t i = 0; i < w; ++i) {
-            double v = 0.0;
-            if (lit && lit->field) {
-                size_t off = (size_t)i * h + src_j; // literal offset (i major)
-                v = lit->field[off];
-            }
-            size_t base = ((size_t)j_gl * w + i) * 4; // GL expects row-major
-            buf[base+0] = (float)v;
-            buf[base+1] = 0.0f; buf[base+2] = 0.0f; buf[base+3] = 0.0f;
-        }
-    }
-    GLuint tex; glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    // Clamp to edge to avoid sampling wrap-around at boundaries when doing stencils
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, buf);
-    free(buf);
-    return tex;
 }
 
 // Read back the current GL color buffer into a new GridField (R channel)
@@ -502,9 +750,6 @@ static GridField* readback_to_field(GridMetadata *grid) {
     float *buf = calloc(w * h * 4, sizeof(float));
     glReadPixels(0, 0, w, h, GL_RGBA, GL_FLOAT, buf);
     GridField *f = grid_field_create(grid);
-    Literal *lit = &f->data;
-    // ensure lit->field allocated and shape set
-    // assume grid_field_create zeroes the literal if needed
     // glReadPixels returns rows with the bottom row first. Map that into the
     // grid which expects j=0 as the top row by flipping vertically when
     // writing into the grid field.
@@ -521,169 +766,222 @@ static GridField* readback_to_field(GridMetadata *grid) {
     return f;
 }
 
-// Main GPU-run: compile shader, upload inputs, render to FBO, readback result
-GridField* gpu_run_program_cpu(GPUProgram *prog, Dictionary *inputs, GridMetadata *grid) {
-    (void)grid; // use prog->grid
-    if (!prog || prog->n_kernels == 0) return NULL;
+/* Helper: ensure the GPUContext has a valid GL context for the given dimensions.
+   Returns 0 on success, -1 on failure. */
+static int ctx_ensure_initialized(GPUContext *ctx, int w, int h) {
+    if (ctx->initialized) return 0;
+    if (gl_make_context_hidden(&ctx->win, &ctx->gl_ctx, w, h) != 0) return -1;
+    ctx->width = w; ctx->height = h;
+    /* Create the shared persistent FBO */
+    glGenFramebuffers(1, &ctx->fbo);
+    ctx->initialized = 1;
+    return 0;
+}
+
+/* Helper: compile and link a kernel's GL program; cache result in k->gl_program.
+   Also caches uniform locations. Returns 0 on success. */
+static int kernel_ensure_program(ShaderKernel *k) {
+    if (k->gl_program) return 0; /* already compiled */
+    const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
+    GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
+    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, k->source);
+    if (!vs || !fs) { if (vs) glDeleteShader(vs); if (fs) glDeleteShader(fs); return -1; }
+    GLuint prog = link_program(vs, fs);
+    glDeleteShader(vs); glDeleteShader(fs);
+    if (!prog) return -1;
+    k->gl_program = prog;
+
+    /* Cache all uniform locations once */
+    k->uloc_dims     = glGetUniformLocation(prog, "dims");
+    k->uloc_spacing  = glGetUniformLocation(prog, "spacing");
+    k->uloc_use_mask = glGetUniformLocation(prog, "use_mask");
+    k->uloc_mask_tex = glGetUniformLocation(prog, "mask_tex");
+    k->uloc_val_tex  = glGetUniformLocation(prog, "val_tex");
+
+    /* Per-input sampler uniform locations */
+    if (k->n_inputs > 0) {
+        k->uloc_inputs = calloc(k->n_inputs, sizeof(int));
+        for (int i = 0; i < k->n_inputs; i++) {
+            char uname[128];
+            snprintf(uname, sizeof(uname), "%s_tex", k->inputs[i]);
+            k->uloc_inputs[i] = glGetUniformLocation(prog, uname);
+        }
+    }
+    return 0;
+}
+
+/* Helper: upload or re-upload a single input texture into the kernel's cache.
+   Uses glTexSubImage2D when the texture already exists and dimensions match. */
+static void kernel_upload_input(ShaderKernel *k, int idx, const GridField *field) {
+    uint32_t w = field->grid->dims[0];
+    uint32_t h = field->grid->dims[1];
+    /* Build the pixel buffer (RGBA32F, row-major, Y-flipped to match GL) */
+    float *buf = calloc(w * h * 4, sizeof(float));
+    const Literal *lit = &field->data;
+    for (uint32_t j_gl = 0; j_gl < h; ++j_gl) {
+        uint32_t src_j = h - 1 - j_gl;
+        for (uint32_t i = 0; i < w; ++i) {
+            double v = 0.0;
+            if (lit && lit->field) { size_t off = (size_t)i * h + src_j; v = lit->field[off]; }
+            size_t base = ((size_t)j_gl * w + i) * 4;
+            buf[base+0] = (float)v;
+        }
+    }
+    if (k->gl_input_tex[idx] == 0 ||
+        k->tex_width != (int)w || k->tex_height != (int)h) {
+        /* First upload or size change: create/recreate texture */
+        if (k->gl_input_tex[idx]) glDeleteTextures(1, &k->gl_input_tex[idx]);
+        glGenTextures(1, &k->gl_input_tex[idx]);
+        glBindTexture(GL_TEXTURE_2D, k->gl_input_tex[idx]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, buf);
+    } else {
+        /* Same size: fast sub-image update avoids re-allocation */
+        glBindTexture(GL_TEXTURE_2D, k->gl_input_tex[idx]);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_FLOAT, buf);
+    }
+    free(buf);
+}
+
+/* Core GPU execution using a persistent GPUContext.
+   ctx must not be NULL. Returns a new GridField owned by the caller. */
+GridField* gpu_run_program(GPUProgram *prog, Dictionary *inputs, GPUContext *ctx) {
+    if (!prog || prog->n_kernels == 0 || !ctx) return NULL;
     ShaderKernel *k = prog->kernels[0];
     if (!k || !k->source) return NULL;
 
     int w = prog->grid->dims[0];
     int h = prog->grid->dims[1];
-    SDL_Window *win = NULL; SDL_GLContext ctx;
-    if (gl_make_context_hidden(&win, &ctx, w, h) != 0) return NULL;
-    // Auto-generate boundary mask if any input GridField's grid has boundaries
+
+    /* Initialise the persistent GL context if this is the first call */
+    if (ctx_ensure_initialized(ctx, w, h) != 0) return NULL;
+
+    /* Auto-generate boundary mask from grid BC definitions (once per program) */
     if (!prog->boundary_mask) {
-    // look through provided inputs dictionary for GridField literals
-    // if any grid has non-default boundaries or interior boundaries, create mask
-    // Note: this is a conservative heuristic to attach masks automatically
-    // Instead, if program has a grid with boundaries defined, auto-generate
         GridMetadata *g = prog->grid;
         if (g && g->boundaries) {
-            // check if any edge boundary is Dirichlet or any interior boundary exists
             bool has_bc = false;
-            for (int i = 0; i < g->n_dims * 2; ++i) {
+            for (int i = 0; i < g->n_dims * 2; ++i)
                 if (g->boundaries[i].type != BC_OPEN) { has_bc = true; break; }
-            }
             if (!has_bc && g->n_interior_boundaries > 0) has_bc = true;
-            if (has_bc) {
-                BoundaryMask *bm = boundary_mask_create(g);
-                prog->boundary_mask = bm;
-            }
+            if (has_bc) prog->boundary_mask = boundary_mask_create(g);
         }
     }
 
-    // If program has an attached boundary mask, ensure its GL textures are created
-    if (prog->boundary_mask) {
-        // boundary_mask_upload will create GL textures using the current context
-        boundary_mask_upload(prog->boundary_mask, NULL);
+    /* Upload boundary mask textures only when dirty or not yet uploaded */
+    if (prog->boundary_mask && (prog->boundary_mask->dirty || !prog->boundary_mask->uploaded)) {
+        boundary_mask_upload(prog->boundary_mask, ctx);
     }
 
-    // generated fragment shader is available in k->source (debug prints removed)
+    /* Compile and link the GL shader program once; reuse on subsequent calls */
+    if (kernel_ensure_program(k) != 0) return NULL;
 
-    // compile shaders
-    const char *vs_src = "void main() { gl_Position = gl_Vertex; gl_TexCoord[0] = gl_MultiTexCoord0; }";
-    GLuint vs = compile_shader(GL_VERTEX_SHADER, vs_src);
-    GLuint fs = compile_shader(GL_FRAGMENT_SHADER, k->source);
-    if (!vs || !fs) { gl_destroy_context(win, ctx); return NULL; }
-    GLuint prog_gl = link_program(vs, fs);
-    glDeleteShader(vs); glDeleteShader(fs);
-    if (!prog_gl) { gl_destroy_context(win, ctx); return NULL; }
+    /* Ensure input texture cache is allocated */
+    if (!k->gl_input_tex && k->n_inputs > 0) {
+        k->gl_input_tex = calloc(k->n_inputs, sizeof(unsigned int));
+        k->n_gl_inputs  = k->n_inputs;
+    }
 
-    // create textures for inputs from dictionary
-    GLuint *texs = calloc(k->n_inputs, sizeof(GLuint));
-    for (int i=0;i<k->n_inputs;i++) {
+    /* Upload / refresh each input texture */
+    for (int i = 0; i < k->n_inputs; i++) {
         Literal *lit = NULL;
         dict_get(inputs, k->inputs[i], &lit);
-        if (!lit) { texs[i]=0; continue; }
-    /* debug prints removed: upload happens below */
-        // wrap literal as GridField for upload helper
+        if (!lit) { continue; }
         GridField tmp = { .name = NULL, .grid = prog->grid, .data = *lit };
-        texs[i] = upload_field_as_texture(&tmp);
+        kernel_upload_input(k, i, &tmp);
+    }
+    /* Record current grid dimensions for future size-change detection */
+    k->tex_width  = w;
+    k->tex_height = h;
+
+    /* Ensure the persistent output texture exists and matches current dimensions */
+    if (!k->gl_output_tex || k->tex_width != w || k->tex_height != h) {
+        if (k->gl_output_tex) glDeleteTextures(1, &k->gl_output_tex);
+        glGenTextures(1, &k->gl_output_tex);
+        glBindTexture(GL_TEXTURE_2D, k->gl_output_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
     }
 
-    /* Readback-of-upload debug removed to avoid noisy output in normal runs */
-
-    // create FBO and output texture
-    GLuint out_tex; glGenTextures(1, &out_tex);
-    glBindTexture(GL_TEXTURE_2D, out_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    // Ensure output texture also clamps at edges
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, w, h, 0, GL_RGBA, GL_FLOAT, NULL);
-    GLuint fbo; glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, out_tex, 0);
+    /* Bind the shared persistent FBO and attach the output texture */
+    glBindFramebuffer(GL_FRAMEBUFFER, ctx->fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, k->gl_output_tex, 0);
 
     GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     if (status != GL_FRAMEBUFFER_COMPLETE) {
         fprintf(stderr, "FBO incomplete: 0x%x\n", status);
-        // cleanup
-        for (int i=0;i<k->n_inputs;i++) if (texs[i]) glDeleteTextures(1, &texs[i]);
-        free(texs);
-        glDeleteTextures(1, &out_tex);
-        glDeleteFramebuffers(1, &fbo);
-        glDeleteProgram(prog_gl);
-        gl_destroy_context(win, ctx);
         return NULL;
     }
 
     glViewport(0, 0, w, h);
-    glUseProgram(prog_gl);
+    glUseProgram(k->gl_program);
 
-    // bind input textures to texture units and set uniform samplers
-    for (int i=0;i<k->n_inputs;i++) {
-        GLenum unit = GL_TEXTURE0 + i;
-        glActiveTexture(unit);
-        glBindTexture(GL_TEXTURE_2D, texs[i]);
-        // try to set uniform by name: <var>_tex
-        char uname[128]; snprintf(uname, sizeof(uname), "%s_tex", k->inputs[i]);
-        GLint loc = glGetUniformLocation(prog_gl, uname);
-        if (loc >= 0) {
-            glUniform1i(loc, i);
-        }
+    /* Bind input textures using cached uniform locations */
+    for (int i = 0; i < k->n_inputs; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, k->gl_input_tex ? k->gl_input_tex[i] : 0);
+        if (k->uloc_inputs && k->uloc_inputs[i] >= 0)
+            glUniform1i(k->uloc_inputs[i], i);
     }
 
-    // If caller attached a BoundaryMask to the program, bind its textures to following units
-    int bm_unit = k->n_inputs; // next free texture unit
+    /* Bind boundary mask textures */
+    int bm_unit = k->n_inputs;
     if (prog->boundary_mask) {
-        // mask_tex -> unit bm_unit, val_tex -> unit bm_unit+1
         if (prog->boundary_mask->mask_tex) {
             glActiveTexture(GL_TEXTURE0 + bm_unit);
             glBindTexture(GL_TEXTURE_2D, prog->boundary_mask->mask_tex);
-            GLint locm = glGetUniformLocation(prog_gl, "mask_tex"); if (locm >= 0) glUniform1i(locm, bm_unit);
+            if (k->uloc_mask_tex >= 0) glUniform1i(k->uloc_mask_tex, bm_unit);
         }
         if (prog->boundary_mask->values_tex) {
             glActiveTexture(GL_TEXTURE0 + bm_unit + 1);
             glBindTexture(GL_TEXTURE_2D, prog->boundary_mask->values_tex);
-            GLint locv = glGetUniformLocation(prog_gl, "val_tex"); if (locv >= 0) glUniform1i(locv, bm_unit+1);
+            if (k->uloc_val_tex >= 0) glUniform1i(k->uloc_val_tex, bm_unit + 1);
         }
     }
 
-    // set grid uniforms if present
-    GLint loc_dims = glGetUniformLocation(prog_gl, "dims");
-    if (loc_dims >= 0) {
-        glUniform2i(loc_dims, prog->grid->dims[0], prog->grid->dims[1]);
-    }
-    GLint loc_spacing = glGetUniformLocation(prog_gl, "spacing");
-    if (loc_spacing >= 0) {
-        glUniform2f(loc_spacing, (float)prog->grid->spacing[0], (float)prog->grid->spacing[1]);
-    }
-    // indicate whether boundary mask sampling should be active
-    GLint loc_use_mask = glGetUniformLocation(prog_gl, "use_mask");
-    if (loc_use_mask >= 0) {
-        if (prog->boundary_mask) glUniform1i(loc_use_mask, 1);
-        else glUniform1i(loc_use_mask, 0);
-    }
+    /* Set grid uniforms using cached locations */
+    if (k->uloc_dims >= 0)    glUniform2i(k->uloc_dims, w, h);
+    if (k->uloc_spacing >= 0) glUniform2f(k->uloc_spacing, (float)prog->grid->spacing[0], (float)prog->grid->spacing[1]);
+    if (k->uloc_use_mask >= 0) glUniform1i(k->uloc_use_mask, prog->boundary_mask ? 1 : 0);
 
-    // draw into FBO
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    /* Render */
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
-    glClearColor(0,0,0,0); glClear(GL_COLOR_BUFFER_BIT);
-    glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glClearColor(0, 0, 0, 0); glClear(GL_COLOR_BUFFER_BIT);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
     draw_fullscreen_quad();
     glFlush();
 
-    // read back into GridField
+    /* Read back result */
     GridField *out = readback_to_field(prog->grid);
+    return out;
+}
 
-    // cleanup
-    for (int i=0;i<k->n_inputs;i++) if (texs[i]) { glDeleteTextures(1, &texs[i]); }
-    free(texs);
-    glDeleteTextures(1, &out_tex);
-    glDeleteFramebuffers(1, &fbo);
-    glDeleteProgram(prog_gl);
-    gl_destroy_context(win, ctx);
-
+/* Legacy single-shot path: creates a temporary context, runs, destroys it.
+   Kept for test compatibility; prefer gpu_run_program with a persistent context. */
+GridField* gpu_run_program_cpu(GPUProgram *prog, Dictionary *inputs, GridMetadata *grid) {
+    (void)grid;
+    if (!prog || prog->n_kernels == 0) return NULL;
+    GPUContext *tmp_ctx = gpu_context_create(prog->backend);
+    if (!tmp_ctx) return NULL;
+    GridField *out = gpu_run_program(prog, inputs, tmp_ctx);
+    gpu_context_free(tmp_ctx);
     return out;
 }
 
 int gpu_execute_program(GPUContext *ctx, GPUProgram *prog, Dictionary *inputs, int output_slot) {
-    (void)ctx; (void)output_slot;
-    GridField *out = gpu_run_program_cpu(prog, inputs, prog->grid);
+    (void)output_slot;
+    if (!ctx || !prog) return 1;
+    GridField *out = gpu_run_program(prog, inputs, ctx);
     if (!out) return 1;
+    /* The result is currently discarded; callers that need the output should
+       call gpu_run_program directly and obtain the returned GridField. */
     grid_field_free(out);
     return 0;
 }
@@ -692,7 +990,51 @@ int gpu_execute_kernel(GPUContext *ctx, ShaderKernel *kernel, int *input_slots, 
     (void)ctx; (void)kernel; (void)input_slots; (void)output_slot; return 0;
 }
 
-void gpu_context_free(GPUContext *ctx) { free(ctx); }
+void gpu_context_free(GPUContext *ctx) {
+    if (!ctx) return;
+    if (ctx->initialized) {
+        if (ctx->fbo) {
+            glDeleteFramebuffers(1, &ctx->fbo);
+            ctx->fbo = 0;
+        }
+        /* Only destroy SDL window/context when we created them ourselves */
+        if (!ctx->adopted) {
+            gl_destroy_context(ctx->win, ctx->gl_ctx);
+        }
+        ctx->initialized = 0;
+    }
+    free(ctx);
+}
+
+/* Fill an already-created GPUContext with caller-owned SDL resources.
+   Called by gpu_context_adopt() in gpu_sim.c.                          */
+void gpu_context_adopt_sdl(GPUContext *ctx,
+                            void *sdl_window,
+                            void *sdl_gl_context,
+                            int width, int height) {
+    if (!ctx) return;
+    ctx->win         = (SDL_Window *)sdl_window;
+    ctx->gl_ctx      = (SDL_GLContext)sdl_gl_context;
+    ctx->width       = width;
+    ctx->height      = height;
+    ctx->adopted     = 1;
+    ctx->initialized = 1;
+    /* Create the shared persistent FBO in the adopted context */
+    if (!ctx->fbo) {
+        glGenFramebuffers(1, &ctx->fbo);
+    }
+}
+
+/* Return the persistent FBO id (0 if context not initialised).         */
+GLuint gpu_context_get_fbo(GPUContext *ctx) {
+    if (!ctx || !ctx->initialized) return 0;
+    return ctx->fbo;
+}
+
+/* Public wrapper so gpu_sim.c can trigger shader compilation.          */
+int gpu_kernel_ensure_program(ShaderKernel *k) {
+    return kernel_ensure_program(k);
+}
 
 void gpu_program_set_boundary_mask(GPUProgram *prog, struct BoundaryMask *bm) {
     if (!prog) return;

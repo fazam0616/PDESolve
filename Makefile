@@ -94,3 +94,13 @@ clean:
 .PHONY: run_interactive
 run_interactive: $(BUILD_DIR)/interactive_wave_sim
 	$(BUILD_DIR)/interactive_wave_sim
+
+# Run GPU-accelerated interactive wave simulator
+.PHONY: run_interactive_gpu
+run_interactive_gpu: $(BUILD_DIR)/interactive_wave_sim_gpu
+	$(BUILD_DIR)/interactive_wave_sim_gpu
+
+# Run GPU-accelerated interactive smoke simulator
+.PHONY: run_smoke_gpu
+run_smoke_gpu: $(BUILD_DIR)/interactive_smoke_sim_gpu
+	$(BUILD_DIR)/interactive_smoke_sim_gpu
