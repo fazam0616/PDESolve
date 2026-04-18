@@ -151,6 +151,45 @@ void grid_update_bc_time(GridMetadata *grid, double t);
 void grid_set_boundary_mask(GridMetadata *grid, struct BoundaryMask *bm);
 struct BoundaryMask* grid_get_boundary_mask(GridMetadata *grid);
 
+// ============================================================================
+// Tensor Field — N-rank, SSBO-backed GPU tensor for non-grid computations.
+// Supports arbitrary rank up to TENSOR_MAX_RANK axes.  Intended for finite
+// element DOF arrays, explicit matrix/vector algebra, and any computation that
+// operates on dense tensors rather than volumetric texture grids.
+// ============================================================================
+
+#define TENSOR_MAX_RANK 8
+
+typedef struct {
+    char         *name;                       /* optional identifier (may be NULL) */
+    int           rank;                       /* number of dimensions (1 … TENSOR_MAX_RANK) */
+    int           shape[TENSOR_MAX_RANK];     /* extent along each axis; unused axes are 0 */
+    int           strides[TENSOR_MAX_RANK];   /* row-major strides; strides[rank-1] = 1 */
+    size_t        total;                      /* total number of scalars = Π shape[i] */
+    double       *data;                       /* CPU-side flat buffer (NULL = uninitialised) */
+    unsigned int  ssbo;                       /* GL SSBO handle (0 = not yet uploaded) */
+    bool          gpu_dirty;                  /* true when CPU data is newer than the SSBO */
+} TensorField;
+
+/* Create a zero-initialised TensorField.  rank must be in [1, TENSOR_MAX_RANK].
+   shape[i] is the size along axis i (row-major, i.e. shape[0] changes slowest). */
+TensorField* tensor_field_create(int rank, const int *shape);
+
+/* Free all CPU resources.  The caller must delete the GL SSBO (if any) while a
+   GL context is current by calling tensor_field_delete_ssbo before this, or by
+   using gpu_tensor_field_free() which handles both. */
+void         tensor_field_free(TensorField *tf);
+
+/* Compute the row-major flat index for the given N-D index array. */
+size_t       tensor_field_linear_index(const TensorField *tf, const int *indices);
+
+/* Element access (CPU-side only; download from GPU first if needed). */
+double       tensor_field_get(const TensorField *tf, const int *indices);
+void         tensor_field_set(TensorField *tf, const int *indices, double value);
+
+/* Delete the GL SSBO handle while a context is current, then clear the handle. */
+void         tensor_field_delete_ssbo(TensorField *tf);
+
 #endif // GRID_H
 #ifndef GRID_H
 #define GRID_H

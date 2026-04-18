@@ -878,12 +878,12 @@ static int wave_sim_gpu_init(WaveSimGPU *g,
     double c = 1.0;
     double c2dt2 = c * c * dt * dt;
     Expression *c2dt2_lit = expr_literal(literal_create_scalar(c2dt2));
-    Expression *accel     = expr_multiply(c2dt2_lit, lap);
+    Expression *wave_accel = expr_multiply(c2dt2_lit, lap);
     Expression *two       = expr_literal(literal_create_scalar(2.0));
     Expression *two_u     = expr_multiply(two, u_curr);
     Expression *neg_prev  = expr_negate(u_prev);
     Expression *diff      = expr_add(two_u, neg_prev);
-    g->wave_expr    = expr_add(diff, accel);
+    g->wave_expr    = expr_add(diff, wave_accel);
     g->compute_prog = gpu_compile_optimized(g->wave_expr, grid, GPU_BACKEND_OPENGL);
     if (!g->compute_prog) {
         fprintf(stderr, "wave compute gpu_compile_optimized failed\n");

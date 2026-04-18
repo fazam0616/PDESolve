@@ -134,4 +134,81 @@ unsigned int gpu_context_get_fbo(GPUContext *ctx);
    Caches all uniform locations.  Returns 0 on success.                  */
 int gpu_kernel_ensure_program(ShaderKernel *k);
 
+/* Ensure the GPUContext has a valid GL 4.3 context (creates a hidden 1×1
+   off-screen window if not yet initialised).  Used by gpu_tensor.c.
+   Returns 0 on success, -1 on failure.                                 */
+int gpu_context_ensure(GPUContext *ctx);
+
+// ============================================================================
+// Compute Kernel — OpenGL 4.3 compute shaders for N-rank tensor operations.
+//
+// Operates on TensorField (SSBO-backed) rather than GridField (texture-backed).
+// Supports OP_EINSUM with arbitrary subscripts, OP_MATMUL, OP_DOT,
+// OP_TRANSPOSE, and elementwise ops (OP_ADD, OP_MULTIPLY, OP_NEGATE, …).
+// ============================================================================
+
+/* Maximum number of SSBO input bindings per ComputeKernel. */
+#define COMPUTE_MAX_INPUTS 16
+
+typedef struct {
+    char        *glsl_src;       /* #version 430 core compute shader source */
+    unsigned int gl_program;     /* compiled compute program (0 = not yet compiled) */
+    char       **input_names;    /* variable name for each SSBO input (owned strings) */
+    int          n_inputs;       /* number of input SSBOs    */
+    int          output_binding; /* SSBO binding index for output = n_inputs */
+    int          workgroup_x;    /* local_size_x for glDispatchCompute */
+    int          workgroup_y;    /* local_size_y */
+    int          workgroup_z;    /* local_size_z */
+} ComputeKernel;
+
+/* A compiled tensor program — analogous to GPUProgram but for compute shaders.
+   Carries enough metadata to infer output shape at dispatch time.           */
+typedef struct {
+    ComputeKernel **kernels;     /* currently always one kernel per program */
+    int             n_kernels;
+    GPUBackend      backend;
+    /* Metadata for output-shape inference at dispatch time */
+    Operation       op;           /* root tensor operation */
+    char           *left_indices; /* EINSUM subscript for left input  (owned, may be NULL) */
+    char           *right_indices;/* EINSUM subscript for right input (owned, may be NULL) */
+    char           *out_indices;  /* EINSUM subscript for output      (owned, may be NULL) */
+} TensorProgram;
+
+/* Compile an expression whose leaf variables are TensorFields into a
+   TensorProgram.  Supported root operations:
+     • OP_EINSUM  — arbitrary subscript (e.g. "ij,jk->ik")
+     • OP_MATMUL  — synthesised as EINSUM "ij,jk->ik"
+     • OP_DOT     — synthesised as EINSUM "i,i->"
+     • OP_TRANSPOSE — synthesised as EINSUM "ij->ji" (rank-2 only via this helper;
+                      for higher rank use OP_EINSUM with explicit subscripts)
+     • OP_ADD, OP_NEGATE, OP_MULTIPLY, OP_POW, OP_MIN, OP_MAX — elementwise
+   Returns NULL if the expression is not supported.                          */
+TensorProgram* gpu_compile_tensor_expr(Expression *expr, GPUBackend backend);
+
+/* Free a TensorProgram and all owned resources.                             */
+void tensor_program_free(TensorProgram *prog);
+
+/* Upload CPU data → GPU SSBO (requires an active GL context).
+   No-op if tf->gpu_dirty is false.                                          */
+void tensor_field_upload(TensorField *tf);
+
+/* Download GPU SSBO → CPU data (requires an active GL context).             */
+void tensor_field_download(TensorField *tf);
+
+/* Free both GL SSBO and CPU data, then the TensorField itself.
+   Must be called while a GL context is current if tf->ssbo != 0.           */
+void gpu_tensor_field_free(TensorField *tf);
+
+/* Execute a TensorProgram.  input_names / input_tensors are parallel arrays
+   of length n_inputs mapping variable names to TensorField data.  The output
+   shape is inferred automatically from the subscripts and input shapes.
+   Returns a newly allocated TensorField with downloaded results (caller owns).
+   ctx must be a valid GPUContext (call gpu_context_ensure first if needed).  */
+TensorField* gpu_run_tensor_program(TensorProgram  *prog,
+                                    const char    **input_names,
+                                    TensorField   **input_tensors,
+                                    int             n_inputs,
+                                    GPUContext     *ctx);
+
 #endif // GPU_COMPILER_H
+

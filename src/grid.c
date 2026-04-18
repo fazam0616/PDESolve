@@ -1749,3 +1749,74 @@ void grid_update_bc_time(GridMetadata *grid, double t) {
         grid->interior_boundaries[i].bc_spec.time = t;
     }
 }
+
+// ============================================================================
+// Tensor Field — CPU-side implementation
+// GL-side operations (upload, download, SSBO deletion) are in gpu_tensor.c
+// so that grid.c stays free of GL header dependencies.
+// ============================================================================
+
+TensorField* tensor_field_create(int rank, const int *shape) {
+    assert(rank >= 1 && rank <= TENSOR_MAX_RANK);
+    TensorField *tf = calloc(1, sizeof(TensorField));
+    if (!tf) return NULL;
+    tf->rank = rank;
+
+    size_t total = 1;
+    for (int i = 0; i < rank; i++) {
+        assert(shape[i] > 0);
+        tf->shape[i] = shape[i];
+        total *= (size_t)shape[i];
+    }
+
+    /* Compute row-major strides: strides[rank-1] = 1,
+       strides[i] = shape[i+1] * strides[i+1]               */
+    tf->strides[rank - 1] = 1;
+    for (int i = rank - 2; i >= 0; i--)
+        tf->strides[i] = tf->strides[i + 1] * tf->shape[i + 1];
+
+    tf->total      = total;
+    tf->data       = calloc(total, sizeof(double));
+    tf->ssbo       = 0;
+    tf->gpu_dirty  = true;
+    return tf;
+}
+
+void tensor_field_free(TensorField *tf) {
+    if (!tf) return;
+    free(tf->name);
+    free(tf->data);
+    /* Note: ssbo handle, if non-zero, must have been deleted while a GL
+       context is current (call tensor_field_delete_ssbo or
+       gpu_tensor_field_free beforehand).                                */
+    free(tf);
+}
+
+void tensor_field_delete_ssbo(TensorField *tf) {
+    /* This function body is intentionally left as a no-op stub: the actual
+       glDeleteBuffers call lives in gpu_tensor.c where GL headers are
+       available.  Callers that hold a GL context should use
+       gpu_tensor_field_free() instead of tensor_field_free().           */
+    if (!tf) return;
+    /* ssbo deletion deferred to gpu_tensor_field_free */
+}
+
+size_t tensor_field_linear_index(const TensorField *tf, const int *indices) {
+    size_t off = 0;
+    for (int i = 0; i < tf->rank; i++)
+        off += (size_t)indices[i] * (size_t)tf->strides[i];
+    return off;
+}
+
+double tensor_field_get(const TensorField *tf, const int *indices) {
+    if (!tf || !tf->data) return 0.0;
+    return tf->data[tensor_field_linear_index(tf, indices)];
+}
+
+void tensor_field_set(TensorField *tf, const int *indices, double value) {
+    if (!tf) return;
+    if (!tf->data) tf->data = calloc(tf->total, sizeof(double));
+    if (!tf->data) return;
+    tf->data[tensor_field_linear_index(tf, indices)] = value;
+    tf->gpu_dirty = true;
+}

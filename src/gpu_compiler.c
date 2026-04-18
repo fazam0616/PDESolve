@@ -22,6 +22,10 @@ static int gl_make_context_hidden(SDL_Window **out_win, SDL_GLContext *out_ctx, 
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return -1;
     }
+    /* Request GL 4.3 compatibility profile so compute shaders and legacy
+       fragment shaders (#version 120) can coexist in the same context. */
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 0);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
@@ -1034,6 +1038,14 @@ GLuint gpu_context_get_fbo(GPUContext *ctx) {
 /* Public wrapper so gpu_sim.c can trigger shader compilation.          */
 int gpu_kernel_ensure_program(ShaderKernel *k) {
     return kernel_ensure_program(k);
+}
+
+/* Ensure the GPUContext has a valid GL 4.3 context, creating a hidden 1×1
+   off-screen window if the context has not been initialised yet.  Used by
+   gpu_tensor.c to set up a compute-capable context without a framebuffer.
+   Returns 0 on success, -1 on failure. */
+int gpu_context_ensure(GPUContext *ctx) {
+    return ctx_ensure_initialized(ctx, 1, 1);
 }
 
 void gpu_program_set_boundary_mask(GPUProgram *prog, struct BoundaryMask *bm) {

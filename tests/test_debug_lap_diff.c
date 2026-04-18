@@ -1,6 +1,7 @@
 #include "../include/grid.h"
 #include "../include/literal.h"
 #include <stdio.h>
+#include <math.h>
 
 int main() {
     uint32_t dims[3] = {21,21,1};

@@ -1,9 +1,9 @@
 # Compiler and flags
 CC = gcc
-CFLAGS = -Wall -Wextra -Iinclude -O3 -march=native -ffast-math -fopenmp -flto
-LDFLAGS = -fopenmp -flto $(SDL_LDFLAGS)
+CFLAGS = -Wall -Wextra -Iinclude -O3 -march=native -ffast-math -fopenmp -DGLEW_STATIC
+LDFLAGS = -fopenmp $(SDL_LDFLAGS) -lm
 SDL_CFLAGS = $(shell sdl2-config --cflags)
-SDL_LDFLAGS = $(shell sdl2-config --libs) -lGL -lGLEW -lSDL2_ttf
+SDL_LDFLAGS = $(shell sdl2-config --libs) -lopengl32 -lglew32 -lSDL2_ttf
 
 # Directories
 SRC_DIR = src
@@ -25,23 +25,32 @@ EXAMPLE_OBJ_FILES = $(patsubst $(EXAMPLES_DIR)/%.c,$(BUILD_DIR)/%.o,$(EXAMPLE_FI
 TEST_EXECUTABLES = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_FILES))
 EXAMPLE_EXECUTABLES = $(patsubst $(EXAMPLES_DIR)/%.c,$(BUILD_DIR)/%,$(EXAMPLE_FILES))
 
+# Prevent make from deleting source and test object files as intermediates
+.PRECIOUS: $(BUILD_DIR)/%.o
+
 # Default target
 all: $(TEST_EXECUTABLES) $(EXAMPLE_EXECUTABLES)
 
 # Build each test executable
 $(BUILD_DIR)/test_%: $(OBJ_FILES) $(BUILD_DIR)/test_%.o
-	$(CC) $(CFLAGS) $^ -o $@ -lm $(LDFLAGS)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Build example executables (with SDL2 support)
 $(BUILD_DIR)/interactive_wave_sim: $(OBJ_FILES) $(BUILD_DIR)/interactive_wave_sim.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ -lm $(LDFLAGS) $(SDL_LDFLAGS)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/interactive_wave_sim_gpu: $(OBJ_FILES) $(BUILD_DIR)/interactive_wave_sim_gpu.o
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/interactive_smoke_sim_gpu: $(OBJ_FILES) $(BUILD_DIR)/interactive_smoke_sim_gpu.o
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Special dependency: interactive_wave_sim.o depends on its .inc file
 $(BUILD_DIR)/interactive_wave_sim.o: $(EXAMPLES_DIR)/interactive_wave_sim_menu.inc
 
 # Build general example executables: link core objects + example object, include SDL
 $(BUILD_DIR)/%: $(OBJ_FILES) $(BUILD_DIR)/%.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ -lm $(LDFLAGS) $(SDL_LDFLAGS)
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Compile source files
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)

@@ -1,5 +1,6 @@
 #include "../include/literal.h"
 #include <stdio.h>
+#include <string.h>
 
 int main() {
     printf("Starting test...\n");
