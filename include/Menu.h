@@ -66,6 +66,7 @@ void menu_render(Menu *menu, int window_w, int window_h);
 // Font handling (global for Menu module)
 // Returns 0 on success, -1 on failure
 int menu_set_font(const char *font_path, int pt_size);
+int menu_open_font(int pt_size); /* tries common platform paths automatically */
 void menu_clear_font(void);
 void menu_free(Menu *menu);
 // Measure text in pixels using the current font. Returns 0 on success, -1 if no font.

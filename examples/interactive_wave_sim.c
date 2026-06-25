@@ -1287,7 +1287,7 @@ int main(int argc, char **argv) {
     SDL_GL_SetSwapInterval(1); // Enable vsync
     
     // Initialize TTF for menu
-    if (menu_set_font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14) != 0) {
+    if (menu_open_font(14) != 0) {
         printf("Warning: Could not load font, menus may not render properly\n");
     }
     

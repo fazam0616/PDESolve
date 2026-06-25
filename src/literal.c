@@ -1,4 +1,5 @@
 #include "../include/literal.h"
+#include "../include/tensor_ops.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -205,69 +206,25 @@ Literal* literal_broadcast_to_shape(const Literal *src, const uint32_t *target_s
 // For 2D: standard matrix multiplication  
 // For higher dimensions: treat as batch of matrices on last 2 dimensions
 Literal* literal_matmul(Literal *left, Literal *right) {
-    // Accelerated batched matrix multiply using strides
     if (N_DIM < 2) return NULL;
-    uint32_t M = left->shape[N_DIM - 2];
-    uint32_t K = left->shape[N_DIM - 1];
-    uint32_t K2 = right->shape[N_DIM - 2];
-    uint32_t N = right->shape[N_DIM - 1];
+    size_t M = left->shape[N_DIM - 2];
+    size_t K = left->shape[N_DIM - 1];
+    size_t K2 = right->shape[N_DIM - 2];
+    size_t N = right->shape[N_DIM - 1];
     if (K != K2) return NULL;
 
     uint32_t result_shape[N_DIM];
     for (int d = 0; d < N_DIM - 2; d++) result_shape[d] = left->shape[d];
-    result_shape[N_DIM - 2] = M;
-    result_shape[N_DIM - 1] = N;
+    result_shape[N_DIM - 2] = (uint32_t)M;
+    result_shape[N_DIM - 1] = (uint32_t)N;
 
     Literal *result = literal_create(result_shape);
     if (!result) return NULL;
 
-    // compute strides
-    size_t lstrides[N_DIM], rstrides[N_DIM], rres_strides[N_DIM];
-    compute_strides(left->shape, lstrides);
-    compute_strides(right->shape, rstrides);
-    compute_strides(result_shape, rres_strides);
+    size_t batch = 1;
+    for (int d = 0; d < N_DIM - 2; d++) batch *= left->shape[d];
 
-    // batch iteration over dims 0..N_DIM-3
-    size_t batch_dims = 1;
-    int n_batch_dims = N_DIM - 2;
-    for (int d = 0; d < n_batch_dims; d++) batch_dims *= left->shape[d];
-
-    uint32_t counters[N_DIM];
-    for (int d = 0; d < N_DIM; d++) counters[d] = 0;
-
-    for (size_t b = 0; b < batch_dims; b++) {
-        // compute base offsets for left, right, result
-        size_t loff = 0, roff = 0, roff_res = 0;
-        for (int d = 0; d < n_batch_dims; d++) {
-            loff += (size_t)counters[d] * lstrides[d];
-            roff += (size_t)counters[d] * rstrides[d];
-            roff_res += (size_t)counters[d] * rres_strides[d];
-        }
-
-        for (uint32_t i = 0; i < M; i++) {
-            for (uint32_t j = 0; j < N; j++) {
-                double sum = 0.0;
-                size_t lbase = loff + (size_t)i * lstrides[n_batch_dims] ;
-                size_t rbase_col = roff + (size_t)j * rstrides[n_batch_dims + 1];
-                for (uint32_t k = 0; k < K; k++) {
-                    size_t lidx = lbase + (size_t)k * lstrides[n_batch_dims + 1];
-                    size_t ridx = rbase_col + (size_t)k * rstrides[n_batch_dims];
-                    double a = left->field ? left->field[lidx] : 0.0;
-                    double b = right->field ? right->field[ridx] : 0.0;
-                    sum += a * b;
-                }
-                size_t out_idx = roff_res + (size_t)i * rres_strides[n_batch_dims] + (size_t)j * rres_strides[n_batch_dims + 1];
-                result->field[out_idx] = sum;
-            }
-        }
-
-        // increment batch counters
-        for (int d = n_batch_dims - 1; d >= 0; d--) {
-            counters[d]++;
-            if (counters[d] < left->shape[d]) break;
-            counters[d] = 0;
-        }
-    }
+    tops_matmul(result->field, left->field, right->field, M, K, N, batch);
     return result;
 }
 
@@ -283,22 +240,7 @@ Literal* literal_dot(Literal *left, Literal *right) {
     Literal *result = literal_create(scalar_shape);
     if (!result) return NULL;
     size_t size = literal_total_elements(left);
-    double sum = 0.0;
-    const double *lptr = left->field;
-    const double *rptr = right->field;
-    if (lptr && rptr) {
-        for (size_t i = 0; i < size; i++) sum += lptr[i] * rptr[i];
-    } else {
-        // fallback if either is sparse (NULL) - treat NULL as zeros
-        if (lptr) {
-            for (size_t i = 0; i < size; i++) sum += lptr[i] * (rptr ? rptr[i] : 0.0);
-        } else if (rptr) {
-            for (size_t i = 0; i < size; i++) sum += (lptr ? lptr[i] : 0.0) * rptr[i];
-        } else {
-            sum = 0.0;
-        }
-    }
-    if (result->field) result->field[0] = sum;
+    if (result->field) result->field[0] = tops_dot(left->field, right->field, size);
     return result;
 }
 
@@ -307,47 +249,18 @@ Literal* literal_transpose(Literal *lit, bool *success) {
     *success = false;
     if (N_DIM < 2) return NULL;
     uint32_t result_shape[N_DIM];
-    for (int i = 0; i < N_DIM - 2; i++) {
-        result_shape[i] = lit->shape[i];
-    }
+    for (int i = 0; i < N_DIM - 2; i++) result_shape[i] = lit->shape[i];
     result_shape[N_DIM - 2] = lit->shape[N_DIM - 1];
     result_shape[N_DIM - 1] = lit->shape[N_DIM - 2];
     Literal *result = literal_create(result_shape);
     if (!result) return NULL;
-    int n_batch_dims = N_DIM - 2;
-    size_t batch_count = 1;
-    for (int d = 0; d < n_batch_dims; d++) batch_count *= lit->shape[d];
 
-    size_t lstrides[N_DIM], rstrides[N_DIM];
-    compute_strides(lit->shape, lstrides);
-    compute_strides(result_shape, rstrides);
+    size_t batch = 1;
+    for (int d = 0; d < N_DIM - 2; d++) batch *= lit->shape[d];
+    size_t M = lit->shape[N_DIM - 2];
+    size_t N = lit->shape[N_DIM - 1];
 
-    uint32_t counters[N_DIM];
-    for (int d = 0; d < N_DIM; d++) counters[d] = 0;
-
-    uint32_t M = lit->shape[N_DIM - 2];
-    uint32_t N = lit->shape[N_DIM - 1];
-
-    for (size_t b = 0; b < batch_count; b++) {
-        size_t in_base = 0, out_base = 0;
-        for (int d = 0; d < n_batch_dims; d++) {
-            in_base += (size_t)counters[d] * lstrides[d];
-            out_base += (size_t)counters[d] * rstrides[d];
-        }
-        for (uint32_t i = 0; i < M; i++) {
-            for (uint32_t j = 0; j < N; j++) {
-                size_t in_idx = in_base + (size_t)i * lstrides[n_batch_dims] + (size_t)j * lstrides[n_batch_dims + 1];
-                size_t out_idx = out_base + (size_t)j * rstrides[n_batch_dims] + (size_t)i * rstrides[n_batch_dims + 1];
-                double v = lit->field ? lit->field[in_idx] : 0.0;
-                result->field[out_idx] = v;
-            }
-        }
-        for (int d = n_batch_dims - 1; d >= 0; d--) {
-            counters[d]++;
-            if (counters[d] < lit->shape[d]) break;
-            counters[d] = 0;
-        }
-    }
+    tops_transpose(result->field, lit->field, M, N, batch);
     *success = true;
     return result;
 }
@@ -506,15 +419,11 @@ Literal* literal_einsum(Literal *left, const char *left_indices,
         // Transpose: ij->ji
         if (strlen(left_indices) == 2 && strlen(out_indices) == 2 &&
             left_indices[0] == out_indices[1] && left_indices[1] == out_indices[0]) {
-            // Get matrix dimensions from last two dims (assuming [batch, rows, cols])
-            uint32_t m = left->shape[N_DIM - 2];
-            uint32_t n = left->shape[N_DIM - 1];
-            
-            for (uint32_t i = 0; i < m; i++) {
-                for (uint32_t j = 0; j < n; j++) {
-                    result->field[j * m + i] = left->field[i * n + j];
-                }
-            }
+            size_t M = left->shape[N_DIM - 2];
+            size_t N = left->shape[N_DIM - 1];
+            size_t batch = 1;
+            for (int d = 0; d < N_DIM - 2; d++) batch *= left->shape[d];
+            tops_transpose(result->field, left->field, M, N, batch);
             *success = true;
             return result;
         }
@@ -541,27 +450,14 @@ Literal* literal_einsum(Literal *left, const char *left_indices,
             left_indices[1] == right_indices[0] &&
             left_indices[0] == out_indices[0] &&
             right_indices[1] == out_indices[1]) {
-            // Use last two dimensions
-            uint32_t m = left->shape[N_DIM - 2];
-            uint32_t k = left->shape[N_DIM - 1];
-            uint32_t k2 = right->shape[N_DIM - 2];
-            uint32_t n = right->shape[N_DIM - 1];
-            
-            // Check contraction dimension matches
-            if (k != k2) {
-                literal_free(result);
-                return NULL;
-            }
-            
-            for (uint32_t i = 0; i < m; i++) {
-                for (uint32_t j = 0; j < n; j++) {
-                    double sum = 0.0;
-                    for (uint32_t kk = 0; kk < k; kk++) {
-                        sum += left->field[i * k + kk] * right->field[kk * n + j];
-                    }
-                    result->field[i * n + j] = sum;
-                }
-            }
+            size_t m = left->shape[N_DIM - 2];
+            size_t k = left->shape[N_DIM - 1];
+            size_t k2 = right->shape[N_DIM - 2];
+            size_t n = right->shape[N_DIM - 1];
+            if (k != k2) { literal_free(result); return NULL; }
+            size_t batch = 1;
+            for (int d = 0; d < N_DIM - 2; d++) batch *= left->shape[d];
+            tops_matmul(result->field, left->field, right->field, m, k, n, batch);
             *success = true;
             return result;
         }
@@ -587,12 +483,8 @@ Literal* literal_einsum(Literal *left, const char *left_indices,
         // Dot product: i,i->  (empty output)
         if (strlen(left_indices) == 1 && strlen(right_indices) == 1 &&
             left_indices[0] == right_indices[0] && strlen(out_indices) == 0) {
-            double sum = 0.0;
-            uint32_t n = left->shape[N_DIM - 1];
-            for (uint32_t i = 0; i < n; i++) {
-                sum += left->field[i] * right->field[i];
-            }
-            result->field[0] = sum;
+            size_t n = literal_total_elements(left);
+            if (result->field) result->field[0] = tops_dot(left->field, right->field, n);
             *success = true;
             return result;
         }
@@ -652,44 +544,13 @@ Literal* literal_add(Literal *left, Literal *right) {
     if (!result) return NULL;
 
     if (identical) {
-        // direct memory loop; handle null fields as zeros
-        const double *lptr = left->field;
-        const double *rptr = right->field;
-        double *out = result->field;
-        for (size_t i = 0; i < total; i++) {
-            double a = lptr ? lptr[i] : 0.0;
-            double b = rptr ? rptr[i] : 0.0;
-            out[i] = a + b;
-        }
+        tops_add_into(result->field, left->field, right->field, total);
         return result;
     }
 
-    // Broadcasting case: iterate with counters and precomputed strides to avoid modulo/div
-    size_t lstrides[N_DIM], rstrides[N_DIM];
-    compute_strides(left->shape, lstrides);
-    compute_strides(right->shape, rstrides);
-    uint32_t counters[N_DIM];
-    for (int d = 0; d < N_DIM; d++) counters[d] = 0;
-    size_t loff = 0, roff = 0;
-    double *out = result->field;
-    for (size_t flat = 0; flat < total; flat++) {
-        // compute offsets by summing counters where dimension >1
-        loff = 0; roff = 0;
-        for (int d = 0; d < N_DIM; d++) {
-            if (left->shape[d] != 1) loff += (size_t)counters[d] * lstrides[d];
-            if (right->shape[d] != 1) roff += (size_t)counters[d] * rstrides[d];
-        }
-        double a = left->field ? left->field[loff] : 0.0;
-        double b = right->field ? right->field[roff] : 0.0;
-        out[flat] = a + b;
-
-        // increment counters
-        for (int d = N_DIM - 1; d >= 0; d--) {
-            counters[d]++;
-            if (counters[d] < target_shape[d]) break;
-            counters[d] = 0;
-        }
-    }
+    // Broadcasting case
+    tops_add_bcast(result->field, left->field, right->field,
+                   left->shape, right->shape, target_shape, N_DIM);
     return result;
 }
 
@@ -719,41 +580,13 @@ Literal* literal_subtract(Literal *left, Literal *right) {
     if (!result) return NULL;
 
     if (identical) {
-        const double *lptr = left->field;
-        const double *rptr = right->field;
-        double *out = result->field;
-        for (size_t i = 0; i < total; i++) {
-            double a = lptr ? lptr[i] : 0.0;
-            double b = rptr ? rptr[i] : 0.0;
-            out[i] = a - b;
-        }
+        tops_subtract_into(result->field, left->field, right->field, total);
         return result;
     }
 
     // Broadcasting case
-    size_t lstrides[N_DIM], rstrides[N_DIM];
-    compute_strides(left->shape, lstrides);
-    compute_strides(right->shape, rstrides);
-    uint32_t counters[N_DIM];
-    for (int d = 0; d < N_DIM; d++) counters[d] = 0;
-    size_t loff = 0, roff = 0;
-    double *out = result->field;
-    for (size_t flat = 0; flat < total; flat++) {
-        loff = 0; roff = 0;
-        for (int d = 0; d < N_DIM; d++) {
-            if (left->shape[d] != 1) loff += (size_t)counters[d] * lstrides[d];
-            if (right->shape[d] != 1) roff += (size_t)counters[d] * rstrides[d];
-        }
-        double a = left->field ? left->field[loff] : 0.0;
-        double b = right->field ? right->field[roff] : 0.0;
-        out[flat] = a - b;
-
-        for (int d = N_DIM - 1; d >= 0; d--) {
-            counters[d]++;
-            if (counters[d] < target_shape[d]) break;
-            counters[d] = 0;
-        }
-    }
+    tops_subtract_bcast(result->field, left->field, right->field,
+                        left->shape, right->shape, target_shape, N_DIM);
     return result;
 }
 
@@ -783,41 +616,13 @@ Literal* literal_multiply(Literal *left, Literal *right) {
     if (!result) return NULL;
 
     if (identical) {
-        const double *lptr = left->field;
-        const double *rptr = right->field;
-        double *out = result->field;
-        for (size_t i = 0; i < total; i++) {
-            double a = lptr ? lptr[i] : 0.0;
-            double b = rptr ? rptr[i] : 0.0;
-            out[i] = a * b;
-        }
+        tops_multiply_into(result->field, left->field, right->field, total);
         return result;
     }
 
     // Broadcasting case
-    size_t lstrides[N_DIM], rstrides[N_DIM];
-    compute_strides(left->shape, lstrides);
-    compute_strides(right->shape, rstrides);
-    uint32_t counters[N_DIM];
-    for (int d = 0; d < N_DIM; d++) counters[d] = 0;
-    size_t loff = 0, roff = 0;
-    double *out = result->field;
-    for (size_t flat = 0; flat < total; flat++) {
-        loff = 0; roff = 0;
-        for (int d = 0; d < N_DIM; d++) {
-            if (left->shape[d] != 1) loff += (size_t)counters[d] * lstrides[d];
-            if (right->shape[d] != 1) roff += (size_t)counters[d] * rstrides[d];
-        }
-        double a = left->field ? left->field[loff] : 0.0;
-        double b = right->field ? right->field[roff] : 0.0;
-        out[flat] = a * b;
-
-        for (int d = N_DIM - 1; d >= 0; d--) {
-            counters[d]++;
-            if (counters[d] < target_shape[d]) break;
-            counters[d] = 0;
-        }
-    }
+    tops_multiply_bcast(result->field, left->field, right->field,
+                        left->shape, right->shape, target_shape, N_DIM);
     return result;
 }
 
@@ -910,9 +715,7 @@ Literal* literal_scale(Literal *lit, double scalar) {
     Literal *result = literal_copy(lit);
     if (!result) return NULL;
     size_t size = literal_total_elements(result);
-    if (!result->field) return result; // all zeros
-    double *out = result->field;
-    for (size_t i = 0; i < size; i++) out[i] = out[i] * scalar;
+    tops_scale_inplace(result->field, scalar, size);
     return result;
 }
 
@@ -920,14 +723,7 @@ Literal* literal_scale(Literal *lit, double scalar) {
 double literal_norm(Literal *lit) {
     if (!lit) return 0.0;
     size_t size = literal_total_elements(lit);
-    if (!lit->field) return 0.0;
-    double sum = 0.0;
-    const double *p = lit->field;
-    for (size_t i = 0; i < size; i++) {
-        double v = p[i];
-        sum += v * v;
-    }
-    return sqrt(sum);
+    return tops_norm(lit->field, size);
 }
 // Helper to print a slice of a tensor recursively
 static void _literal_print_recursive(const Literal *lit, int dim, uint32_t *indices) {

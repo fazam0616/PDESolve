@@ -1,4 +1,5 @@
 #include "../include/grid.h"
+#include "../include/tensor_ops.h"
 #include <stdlib.h>
 #include <assert.h>
 #include <string.h>
@@ -1227,63 +1228,48 @@ GridField** grid_field_gradient(const GridField *field) {
 // Grid Field Operations
 // ============================================================================
 
-// Update grid_field_add to use literal_add on data tensors
+// Update grid_field_add to use canonical tensor ops
 GridField* grid_field_add(const GridField *a, const GridField *b) {
     if (!a || !b) return NULL;
     if (a->grid != b->grid) return NULL;
-    
+
     GridField *result = grid_field_create(a->grid);
     if (!result) return NULL;
-    
-    Literal *sum = literal_add(&a->data, &b->data);
-    if (sum) {
-        free(result->data.field);
-        result->data = *sum;
-        free(sum); // Free the wrapper, not the field
-    }
-    
+
+    size_t total = literal_total_elements(&result->data);
+    tops_add_into(result->data.field, a->data.field, b->data.field, total);
     return result;
 }
 
-// Update grid_field_multiply to use literal_multiply on data tensors
+// Update grid_field_multiply to use canonical tensor ops
 GridField* grid_field_multiply(const GridField *a, const GridField *b) {
     if (!a || !b) return NULL;
     if (a->grid != b->grid) return NULL;
-    
+
     GridField *result = grid_field_create(a->grid);
     if (!result) return NULL;
-    
-    Literal *prod = literal_multiply(&a->data, &b->data);
-    if (prod) {
-        free(result->data.field);
-        result->data = *prod;
-        free(prod); // Free the wrapper, not the field
-    }
-    
+
+    size_t total = literal_total_elements(&result->data);
+    tops_multiply_into(result->data.field, a->data.field, b->data.field, total);
     return result;
 }
 
-// Update grid_field_scale to use literal_scale on data tensor
+// Update grid_field_scale to use canonical tensor ops
 GridField* grid_field_scale(const GridField *field, double scalar) {
     if (!field) return NULL;
-    
+
     GridField *result = grid_field_create(field->grid);
     if (!result) return NULL;
-    
-    Literal *scaled = literal_scale(&field->data, scalar);
-    if (scaled) {
-        free(result->data.field);
-        result->data = *scaled;
-        free(scaled); // Free the wrapper, not the field
-    }
-    
+
+    size_t total = literal_total_elements(&result->data);
+    tops_scale_into(result->data.field, field->data.field, scalar, total);
     return result;
 }
 
 void grid_field_scale_inplace(GridField *field, double scalar) {
     if (!field || !field->data.field) return;
     uint64_t size = literal_total_elements(&field->data);
-    for (uint64_t i = 0; i < size; i++) field->data.field[i] *= scalar;
+    tops_scale_inplace(field->data.field, scalar, (size_t)size);
 }
 
 int grid_field_axpy(GridField *y, double a, const GridField *x) {
@@ -1291,7 +1277,7 @@ int grid_field_axpy(GridField *y, double a, const GridField *x) {
     if (y->grid != x->grid) return 1;
     if (!y->data.field || !x->data.field) return 1;
     uint64_t size = literal_total_elements(&y->data);
-    for (uint64_t i = 0; i < size; i++) y->data.field[i] += a * x->data.field[i];
+    tops_axpy(y->data.field, a, x->data.field, (size_t)size);
     return 0;
 }
 
@@ -1300,7 +1286,7 @@ int grid_field_pointwise_multiply_into(const GridField *a, const GridField *b, G
     if (a->grid != b->grid || a->grid != out->grid) return 1;
     if (!a->data.field || !b->data.field || !out->data.field) return 1;
     uint64_t size = literal_total_elements(&out->data);
-    for (uint64_t i = 0; i < size; i++) out->data.field[i] = a->data.field[i] * b->data.field[i];
+    tops_multiply_into(out->data.field, a->data.field, b->data.field, (size_t)size);
     return 0;
 }
 
@@ -1309,14 +1295,15 @@ int grid_field_copy_into(const GridField *src, GridField *dst) {
     if (src->grid != dst->grid) return 1;
     uint64_t size = literal_total_elements(&src->data);
     if (!src->data.field || !dst->data.field) return 1;
-    memcpy(dst->data.field, src->data.field, sizeof(double) * size);
+    tops_copy_into(dst->data.field, src->data.field, (size_t)size);
     return 0;
 }
 
-// Update grid_field_norm to use literal_norm on data tensor
+// Update grid_field_norm to use canonical tensor ops
 double grid_field_norm(const GridField *field) {
     if (!field) return 0.0;
-    return literal_norm(&field->data);
+    size_t total = literal_total_elements(&field->data);
+    return tops_norm(field->data.field, total);
 }
 
 // Update grid_field_copy to deep copy data tensor
@@ -1349,12 +1336,8 @@ GridField* grid_field_subtract(const GridField *a, const GridField *b) {
     GridField *result = grid_field_create(a->grid);
     if (!result) return NULL;
 
-    Literal *diff = literal_subtract((Literal*)&a->data, (Literal*)&b->data);
-    if (diff) {
-        free(result->data.field);
-        result->data = *diff;
-        free(diff);
-    }
+    size_t total = literal_total_elements(&result->data);
+    tops_subtract_into(result->data.field, a->data.field, b->data.field, total);
     return result;
 }
 

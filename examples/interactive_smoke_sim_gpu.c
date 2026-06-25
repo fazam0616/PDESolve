@@ -1170,7 +1170,7 @@ int main(int argc, char **argv) {
     sel_src_radius = fmax(1.0, (app.wave_spread * 3.0 / spacing[0]) * SOURCE_RADIUS_SCALE);
 
      // Try to set font for menus (best-effort)
-    if (menu_set_font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14) != 0) {
+    if (menu_open_font(14) != 0) {
         fprintf(stderr, "menu_set_font failed; menu text may be invisible\n");
     }
     AppMenus *menus = create_app_menus(&app, &render, reset_data);

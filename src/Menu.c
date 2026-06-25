@@ -184,6 +184,31 @@ int menu_set_font(const char *font_path, int pt_size) {
     return 0;
 }
 
+/* Try a list of common platform font paths; returns 0 on first success. */
+int menu_open_font(int pt_size) {
+    static const char *candidates[] = {
+        /* Windows (MINGW / native paths) */
+        "C:/Windows/Fonts/arial.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/tahoma.ttf",
+        /* Linux */
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        /* macOS */
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+        NULL
+    };
+    for (int i = 0; candidates[i]; i++) {
+        if (menu_set_font(candidates[i], pt_size) == 0)
+            return 0;
+    }
+    fprintf(stderr, "menu_open_font: no usable font found\n");
+    return -1;
+}
+
 void menu_clear_font(void) {
     if (g_font) {
         TTF_CloseFont(g_font);
@@ -263,6 +288,21 @@ void menu_draw_text_at(const char *text, int x, int y, Color color) {
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, conv->w, conv->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, conv->pixels);
 
+    /* Push a 2D ortho projection matching window pixels so coordinates are in screen space */
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+    int win_w = vp[2], win_h = vp[3];
+
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0, win_w, win_h, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glUseProgram(0);  /* ensure fixed-function pipeline is active */
+
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_TEXTURE_2D);
@@ -278,6 +318,12 @@ void menu_draw_text_at(const char *text, int x, int y, Color color) {
 
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
+
+    /* Restore matrices */
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
 
     glDeleteTextures(1, &tex);
     SDL_FreeSurface(conv);

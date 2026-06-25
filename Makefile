@@ -1,115 +1,84 @@
-# Compiler and flags
-CC = gcc
+CC     = gcc
 CFLAGS = -Wall -Wextra -Iinclude -O3 -march=native -ffast-math -fopenmp -DGLEW_STATIC
+
+# Platform detection
+UNAME := $(shell uname -s 2>/dev/null)
+ifneq (,$(findstring MINGW,$(UNAME)))
+	SDL_CFLAGS  := $(shell sdl2-config --cflags)
+	SDL_LDFLAGS := $(shell sdl2-config --libs) -lopengl32 -lglew32 -lSDL2_ttf -lcomdlg32 -mconsole
+else
+    SDL_CFLAGS  := $(shell sdl2-config --cflags)
+    SDL_LDFLAGS := $(shell sdl2-config --libs) -lGL -lGLEW -lSDL2_ttf
+endif
+
 LDFLAGS = -fopenmp $(SDL_LDFLAGS) -lm
-SDL_CFLAGS = $(shell sdl2-config --cflags)
-SDL_LDFLAGS = $(shell sdl2-config --libs) -lopengl32 -lglew32 -lSDL2_ttf
 
-# Directories
-SRC_DIR = src
-TEST_DIR = tests
+SRC_DIR      = src
+TEST_DIR     = tests
 EXAMPLES_DIR = examples
-BUILD_DIR = build
+BUILD_DIR    = build
 
-# Source files
-SRC_FILES = $(wildcard $(SRC_DIR)/*.c)
-TEST_FILES = $(wildcard $(TEST_DIR)/*.c)
+SRC_FILES     = $(wildcard $(SRC_DIR)/*.c)
+TEST_FILES    = $(wildcard $(TEST_DIR)/*.c)
 EXAMPLE_FILES = $(wildcard $(EXAMPLES_DIR)/*.c)
 
-# Object files
-OBJ_FILES = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRC_FILES))
-TEST_OBJ_FILES = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%.o,$(TEST_FILES))
-EXAMPLE_OBJ_FILES = $(patsubst $(EXAMPLES_DIR)/%.c,$(BUILD_DIR)/%.o,$(EXAMPLE_FILES))
+OBJ_FILES           = $(patsubst $(SRC_DIR)/%.c,    $(BUILD_DIR)/%.o, $(SRC_FILES))
+TEST_EXECUTABLES    = $(patsubst $(TEST_DIR)/%.c,    $(BUILD_DIR)/%,   $(TEST_FILES))
+EXAMPLE_EXECUTABLES = $(patsubst $(EXAMPLES_DIR)/%.c,$(BUILD_DIR)/%,  $(EXAMPLE_FILES))
 
-# Executables
-TEST_EXECUTABLES = $(patsubst $(TEST_DIR)/%.c,$(BUILD_DIR)/%,$(TEST_FILES))
-EXAMPLE_EXECUTABLES = $(patsubst $(EXAMPLES_DIR)/%.c,$(BUILD_DIR)/%,$(EXAMPLE_FILES))
-
-# Prevent make from deleting source and test object files as intermediates
 .PRECIOUS: $(BUILD_DIR)/%.o
+.PHONY: all clean test run_interactive run_interactive_gpu run_smoke_gpu run_steel
 
-# Default target
 all: $(TEST_EXECUTABLES) $(EXAMPLE_EXECUTABLES)
 
-# Build each test executable
-$(BUILD_DIR)/test_%: $(OBJ_FILES) $(BUILD_DIR)/test_%.o
+# Link test executables
+$(BUILD_DIR)/test_%: $(OBJ_FILES) $(BUILD_DIR)/test_%.o | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-# Build example executables (with SDL2 support)
-$(BUILD_DIR)/interactive_wave_sim: $(OBJ_FILES) $(BUILD_DIR)/interactive_wave_sim.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
+# Link example executables
+$(BUILD_DIR)/%: $(OBJ_FILES) $(BUILD_DIR)/%.o | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/interactive_wave_sim_gpu: $(OBJ_FILES) $(BUILD_DIR)/interactive_wave_sim_gpu.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
-
-$(BUILD_DIR)/interactive_smoke_sim_gpu: $(OBJ_FILES) $(BUILD_DIR)/interactive_smoke_sim_gpu.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Special dependency: interactive_wave_sim.o depends on its .inc file
+# Special dependency for the embedded menu
 $(BUILD_DIR)/interactive_wave_sim.o: $(EXAMPLES_DIR)/interactive_wave_sim_menu.inc
 
-# Build general example executables: link core objects + example object, include SDL
-$(BUILD_DIR)/%: $(OBJ_FILES) $(BUILD_DIR)/%.o
-	$(CC) $(CFLAGS) $(SDL_CFLAGS) $^ -o $@ $(LDFLAGS)
-
-# Compile source files
+# Compile source files (need SDL headers because Menu.c uses SDL)
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c $< -o $@
 
 # Compile test files
 $(BUILD_DIR)/%.o: $(TEST_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c $< -o $@
 
-# Compile example files (with SDL2 flags)
+# Compile example files
 $(BUILD_DIR)/%.o: $(EXAMPLES_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(SDL_CFLAGS) -c $< -o $@
 
-# Create build directory
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Run all tests and summarize results
-.PHONY: test
-test: $(TEST_EXECUTABLES)
-	@echo "Running all tests..."
-	@total=0; passed=0; failed=0; \
-	for exec in $(TEST_EXECUTABLES); do \
-		total=$$((total + 1)); \
-		echo "Running $$exec..."; \
-		if $$exec; then \
-			echo "[PASS] $$exec"; \
-			passed=$$((passed + 1)); \
-		else \
-			echo "[FAIL] $$exec"; \
-			failed=$$((failed + 1)); \
-		fi; \
-	done; \
-	echo "\nSummary:"; \
-	echo "Total Tests: $$total"; \
-	echo "Passed: $$passed"; \
-	echo "Failed: $$failed"; \
-	if [ $$failed -gt 0 ]; then \
-		exit 1; \
-	else \
-		exit 0; \
-	fi
-
-# Clean build files
-.PHONY: clean
 clean:
 	rm -rf $(BUILD_DIR)
 
-# Run interactive wave simulator
-.PHONY: run_interactive
+test: $(TEST_EXECUTABLES)
+	@echo "Running all tests..."; \
+	total=0; passed=0; failed=0; \
+	for exec in $(TEST_EXECUTABLES); do \
+		total=$$((total + 1)); \
+		if $$exec; then echo "[PASS] $$exec"; passed=$$((passed + 1)); \
+		else echo "[FAIL] $$exec"; failed=$$((failed + 1)); fi; \
+	done; \
+	echo "Summary: $$passed/$$total passed"; \
+	[ $$failed -eq 0 ]
+
 run_interactive: $(BUILD_DIR)/interactive_wave_sim
 	$(BUILD_DIR)/interactive_wave_sim
 
-# Run GPU-accelerated interactive wave simulator
-.PHONY: run_interactive_gpu
 run_interactive_gpu: $(BUILD_DIR)/interactive_wave_sim_gpu
 	$(BUILD_DIR)/interactive_wave_sim_gpu
 
-# Run GPU-accelerated interactive smoke simulator
-.PHONY: run_smoke_gpu
 run_smoke_gpu: $(BUILD_DIR)/interactive_smoke_sim_gpu
 	$(BUILD_DIR)/interactive_smoke_sim_gpu
+
+run_steel: $(BUILD_DIR)/interactive_steel_sim
+	$(BUILD_DIR)/interactive_steel_sim
