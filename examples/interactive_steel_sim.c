@@ -648,8 +648,107 @@ static int save_file_dialog(char *p, int n) { (void)p; (void)n; return 0; }
 /* ============================================================
  * MAIN
  * ========================================================== */
+static void print_help(void) {
+    printf(
+"FEM Steel Sim — Real-time finite-element elastic solid simulator\n"
+"\n"
+"Usage: interactive_steel_sim [-h | --help]\n"
+"\n"
+"  -h, --help    Print this help message and exit.\n"
+"\n"
+"=== MODES ====================================================================\n"
+"  The program has two input modes, toggled with Tab:\n"
+"\n"
+"  CURSOR MODE (default on startup)\n"
+"    The mouse cursor is free.  Interact with solid geometry and paint\n"
+"    constraints.  Switch tools with the scroll wheel.\n"
+"\n"
+"  CAMERA MODE\n"
+"    Mouse is captured for first-person look.  WASD moves the camera.\n"
+"    Tab returns to CURSOR MODE.\n"
+"\n"
+"=== CAMERA CONTROLS (CAMERA MODE) ===========================================\n"
+"  W / S           Forward / backward\n"
+"  A / D           Strafe left / right\n"
+"  Space           Move up\n"
+"  Left Ctrl       Move down\n"
+"  Mouse           Look (yaw / pitch)\n"
+"  Tab             Switch to CURSOR MODE\n"
+"\n"
+"=== TOOLS (cycle with the scroll wheel) =====================================\n"
+"  0 - None\n"
+"  1 - Anchor Paint   Hold LMB: pin nodes so they cannot move (shown blue).\n"
+"  2 - Force Paint    Hold LMB: apply a constant force in the camera-forward\n"
+"                     direction to nodes under the cursor (shown red).\n"
+"                     Adjust magnitude with the 'force mag' menu slider.\n"
+"  3 - Clear Paint    Hold LMB: erase anchor or force paint from nodes.\n"
+"  4 - Extrude Face   (default) Hover a face of a prism (highlighted yellow),\n"
+"                     then drag LMB to push or pull that face:\n"
+"                       Drag outward  → grow the solid (blue preview box)\n"
+"                       Drag inward   → shrink the solid\n"
+"                       Drag all the way through → drill a hole (red preview)\n"
+"                     Shift+LMB adds more faces to the group before or during\n"
+"                     a drag so all move together in one operation.\n"
+"\n"
+"=== KEYBOARD SHORTCUTS =======================================================\n"
+"  Tab          Toggle CURSOR / CAMERA mode\n"
+"  R            Reset simulation to rest shape (painted constraints kept)\n"
+"  Shift+R      Rebuild mesh from current CSG (constraints reset)\n"
+"  P            Pause / unpause physics\n"
+"  E            Export scene (CSG + constraints) to .fes via save dialog\n"
+"  O            Open / load a .fes scene file via open dialog\n"
+"  1            Scalar colour: global displacement magnitude\n"
+"  2            Scalar colour: Green-Lagrange strain ||E||_F\n"
+"  3            Scalar colour: volumetric strain (blue/white/red)\n"
+"  4            Scalar colour: accumulated plastic strain\n"
+"  Escape       Quit\n"
+"\n"
+"=== CSG SOLID SYSTEM =========================================================\n"
+"  The simulated object is described by a list of axis-aligned rectangular\n"
+"  prisms (boxes) combined with Constructive Solid Geometry rules:\n"
+"\n"
+"    Additive prism   (sign +1)  Contributes material wherever it occupies\n"
+"                                space in the scene.\n"
+"    Subtractive prism (sign -1) Carves a void out of any additive prism\n"
+"                                it overlaps.  Created automatically when you\n"
+"                                drag the Extrude tool all the way through\n"
+"                                an existing prism face.\n"
+"\n"
+"  The FEM tetrahedral mesh is rebuilt each time you press Shift+R or finish\n"
+"  an extrude operation.  Every lattice cell of width h (set in the menu)\n"
+"  that lies inside the CSG solid becomes two tetrahedra.\n"
+"  Smaller h = finer mesh = higher accuracy but slower simulation.\n"
+"\n"
+"=== SCENE FILES (.fes) =======================================================\n"
+"  Press E to open a save dialog and write a .fes file that stores the full\n"
+"  CSG solid geometry plus every painted anchor and force constraint.\n"
+"  Press O to reload a previously saved .fes scene at any time.\n"
+"\n"
+"=== MENU (left panel) ========================================================\n"
+"  Drag sliders to change material and simulation parameters in real time:\n"
+"    E* (Pa)           Young's modulus (stiffness)\n"
+"    nu                Poisson's ratio\n"
+"    density (kg/m3)   Material density\n"
+"    dt (s)            Physics timestep per substep\n"
+"    substeps          Physics substeps per rendered frame\n"
+"    gravity (m/s2)    Gravitational acceleration\n"
+"    paint radius      Radius of the constraint-paint brush\n"
+"    force mag         Force per node applied by Force Paint\n"
+"    Plasticity on     Enable / disable elastic-plastic material model\n"
+"    yield stress      Stress at which plastic flow begins (Pa)\n"
+"    hardening H       Isotropic strain-hardening modulus (Pa)\n"
+"    fracture strain   Accumulated plastic strain at fracture\n"
+);
+}
+
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
+    /* ---- command-line arguments --------------------------- */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_help();
+            return 0;
+        }
+    }
 
     /* ---- SDL + GL context --------------------------------- */
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
@@ -725,11 +824,11 @@ int main(int argc, char **argv) {
     float cam_pos[3] = {0.5f, 1.5f, 3.0f};
     float cam_yaw    = 0.0f;
     float cam_pitch  = -0.3f;
-    SDL_SetRelativeMouseMode(SDL_TRUE);
+    SDL_SetRelativeMouseMode(SDL_FALSE);
 
     /* ---- state: separate pause from mouse lock ----------- */
     int paused      = 0;     /* physics paused               */
-    int mouse_locked= 1;     /* relative mouse mode on       */
+    int mouse_locked= 0;     /* start in cursor mode         */
 
     /* ---- edit state: hover + multi-face selection + drag - */
     int hover_prism = -1;    /* prism index under cursor     */
@@ -1352,22 +1451,25 @@ int main(int argc, char **argv) {
             /* status line */
             if (paused) {
                 menu_draw_text_at(
-                    "PAUSED  P=unpause  Shift+R=rebuild  Tab=cursor  R=reset",
+                    "PAUSED  P=unpause  Shift+R=rebuild  Tab=cursor  R=reset  E=export  O=open",
                     10, WIN_H-54, yw);
             } else if (!mouse_locked) {
                 menu_draw_text_at(
-                    "CURSOR MODE  Tab=camera  Scroll=tool  Shift+click=select face  LMB=drag",
+                    "CURSOR MODE  Tab=camera  Scroll=tool  Shift+click=multi-select  LMB=drag  E=export  O=open",
                     10, WIN_H-54, wh);
             } else {
                 menu_draw_text_at(
-                    "SIMULATE  Tab=cursor  Scroll=tool  LMB=paint  P=pause  R=reset  Shift+R=rebuild",
+                    "CAMERA  Tab=cursor  Scroll=tool  LMB=paint  P=pause  R=reset  E=export  O=open",
                     10, WIN_H-54, wh);
             }
 
             /* legend bottom-right */
             Color blu={100,130,255,255};
-            menu_draw_text_at("Anchor",  WIN_W-90, WIN_H-54, blu);
-            menu_draw_text_at("Force",   WIN_W-90, WIN_H-38, rd_);
+            Color dim={160,160,160,200};
+            menu_draw_text_at("E=export", WIN_W-110, WIN_H-70, dim);
+            menu_draw_text_at("O=open",   WIN_W-110, WIN_H-54, dim);
+            menu_draw_text_at("Anchor",   WIN_W-90,  WIN_H-38, blu);
+            menu_draw_text_at("Force",    WIN_W-90,  WIN_H-22, rd_);
 
             /* crosshair (camera mode only) */
             if (mouse_locked) {
